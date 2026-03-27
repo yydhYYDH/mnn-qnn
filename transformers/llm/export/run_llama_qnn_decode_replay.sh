@@ -3,7 +3,7 @@ set -euo pipefail
 
 show_usage() {
     cat <<'EOF'
-Usage: run_llama_qnn_decode_replay.sh [build|push|run|pull|all]
+Usage: run_llama_qnn_decode_replay.sh [build|push|run|run-prefill|pull|all|all-prefill]
 
 Environment overrides:
   HOST                 default: oneplus13
@@ -12,6 +12,8 @@ Environment overrides:
   LOCAL_MODEL_PATH     default: models/Qwen3-4B-fp16.gguf
   PROMPT               default: hello
   N_PREDICT            default: 2
+  UBATCH_SIZE          default: 128
+  CLEAN_OUTPUT         default: 0
   DUMP_NAME            default: qnn-replay-hello-full
   LOCAL_PULL_DIR       default: /tmp/${DUMP_NAME}
   PUSH_GRAPH_START     default: 0
@@ -72,6 +74,8 @@ REMOTE_OPS_DIR="${REMOTE_ROOT}/ops-bin"
 LOCAL_MODEL_PATH=${LOCAL_MODEL_PATH:-models/Qwen3-4B-fp16.gguf}
 PROMPT=${PROMPT:-hello}
 N_PREDICT=${N_PREDICT:-2}
+UBATCH_SIZE=${UBATCH_SIZE:-128}
+CLEAN_OUTPUT=${CLEAN_OUTPUT:-0}
 DUMP_NAME=${DUMP_NAME:-qnn-replay-hello-full}
 LOCAL_PULL_DIR=${LOCAL_PULL_DIR:-/tmp/${DUMP_NAME}}
 PUSH_GRAPH_START=${PUSH_GRAPH_START:-0}
@@ -81,6 +85,7 @@ LOCAL_BIN="${LLAMA_ROOT}/build-android/bin/llama-cli"
 LOCAL_GRAPH_DIR="${ROOT_DIR}/transformers/llm/export/model/qnn"
 REMOTE_DUMP_DIR="${REMOTE_ROOT}/${DUMP_NAME}"
 REMOTE_LOG_PATH="${REMOTE_ROOT}/${DUMP_NAME}.log"
+REMOTE_STDOUT_PATH="${REMOTE_ROOT}/${DUMP_NAME}.out"
 
 remote_run_has_results() {
     ssh "${HOST}" "
@@ -97,6 +102,10 @@ push_bin() {
     retry ssh "${HOST}" "mkdir -p '${REMOTE_BIN_DIR}' '${REMOTE_OPS_DIR}'"
     retry rsync -avhP "${LOCAL_BIN}" "${HOST}:${REMOTE_BIN_DIR}/llama-cli"
 
+    # The final top-level graph*.bin files are the real QNN context binaries.
+    # They already contain both decode and prefill graph names. The nested
+    # graph1_*/graph1_*.bin artifacts are intermediate tar packages and should
+    # not be pushed into ops-bin for runtime loading.
     local graph_paths=()
     local i
     for i in $(seq "${PUSH_GRAPH_START}" "${PUSH_GRAPH_END}"); do
@@ -115,33 +124,114 @@ run_remote() {
     local prompt_escaped
     prompt_escaped=$(printf '%q' "${PROMPT}")
 
-    retry --success-check remote_run_has_results -- ssh "${HOST}" "
-        mkdir -p '${REMOTE_ROOT}' && \
-        rm -rf '${REMOTE_DUMP_DIR}' && \
-        cd '${REMOTE_ROOT}' && \
-        env \
-          LD_LIBRARY_PATH='${REMOTE_LIB_DIR}:/system/lib64:/vendor/lib64' \
-          ADSP_LIBRARY_PATH='${REMOTE_LIB_DIR}' \
-          GGML_QNN_BIN_PATH='${REMOTE_OPS_DIR}/graph0.bin' \
-          GGML_QNN_REPLAY_MNN_DECODE=1 \
-          GGML_QNN_REPLAY_DUMP_DIR='${REMOTE_DUMP_DIR}' \
-          GGML_QNN_DECODE_LOG_TOKENS=0 \
-          ./bin/llama-cli \
-            -m '${LOCAL_MODEL_PATH}' \
-            -p ${prompt_escaped} \
-            -n '${N_PREDICT}' \
-            --device QNN \
-            --no-warmup \
-            -no-cnv \
-            2>&1 | tee '${REMOTE_LOG_PATH}'
-    "
+    if [ "${CLEAN_OUTPUT}" = "1" ]; then
+        retry --success-check remote_run_has_results -- ssh "${HOST}" "
+            mkdir -p '${REMOTE_ROOT}' && \
+            rm -rf '${REMOTE_DUMP_DIR}' && \
+            rm -f '${REMOTE_LOG_PATH}' '${REMOTE_STDOUT_PATH}' && \
+            cd '${REMOTE_ROOT}' && \
+            env \
+              LD_LIBRARY_PATH='${REMOTE_LIB_DIR}:/system/lib64:/vendor/lib64' \
+              ADSP_LIBRARY_PATH='${REMOTE_LIB_DIR}' \
+              GGML_QNN_BIN_PATH='${REMOTE_OPS_DIR}/graph0.bin' \
+              GGML_QNN_REPLAY_MNN_DECODE=1 \
+              GGML_QNN_REPLAY_DUMP_DIR='${REMOTE_DUMP_DIR}' \
+              GGML_QNN_DECODE_LOG_TOKENS=0 \
+              ./bin/llama-cli \
+                -m '${LOCAL_MODEL_PATH}' \
+                -p ${prompt_escaped} \
+                -n '${N_PREDICT}' \
+                --device QNN \
+                --no-warmup \
+                -no-cnv \
+                2> '${REMOTE_LOG_PATH}' | tee '${REMOTE_STDOUT_PATH}'
+        "
+    else
+        retry --success-check remote_run_has_results -- ssh "${HOST}" "
+            mkdir -p '${REMOTE_ROOT}' && \
+            rm -rf '${REMOTE_DUMP_DIR}' && \
+            rm -f '${REMOTE_LOG_PATH}' '${REMOTE_STDOUT_PATH}' && \
+            cd '${REMOTE_ROOT}' && \
+            env \
+              LD_LIBRARY_PATH='${REMOTE_LIB_DIR}:/system/lib64:/vendor/lib64' \
+              ADSP_LIBRARY_PATH='${REMOTE_LIB_DIR}' \
+              GGML_QNN_BIN_PATH='${REMOTE_OPS_DIR}/graph0.bin' \
+              GGML_QNN_REPLAY_MNN_DECODE=1 \
+              GGML_QNN_REPLAY_DUMP_DIR='${REMOTE_DUMP_DIR}' \
+              GGML_QNN_DECODE_LOG_TOKENS=0 \
+              ./bin/llama-cli \
+                -m '${LOCAL_MODEL_PATH}' \
+                -p ${prompt_escaped} \
+                -n '${N_PREDICT}' \
+                --device QNN \
+                --no-warmup \
+                -no-cnv \
+                2>&1 | tee '${REMOTE_LOG_PATH}'
+        "
+    fi
+}
+
+run_remote_prefill() {
+    local prompt_escaped
+    prompt_escaped=$(printf '%q' "${PROMPT}")
+
+    if [ "${CLEAN_OUTPUT}" = "1" ]; then
+        retry --success-check remote_run_has_results -- ssh "${HOST}" "
+            mkdir -p '${REMOTE_ROOT}' && \
+            rm -rf '${REMOTE_DUMP_DIR}' && \
+            rm -f '${REMOTE_LOG_PATH}' '${REMOTE_STDOUT_PATH}' && \
+            cd '${REMOTE_ROOT}' && \
+            env \
+              LD_LIBRARY_PATH='${REMOTE_LIB_DIR}:/system/lib64:/vendor/lib64' \
+              ADSP_LIBRARY_PATH='${REMOTE_LIB_DIR}' \
+              GGML_QNN_BIN_PATH='${REMOTE_OPS_DIR}/graph0.bin' \
+              GGML_QNN_RUN_MNN_PREFILL=1 \
+              GGML_QNN_DECODE_LOG_TOKENS=0 \
+              ./bin/llama-cli \
+                -m '${LOCAL_MODEL_PATH}' \
+                -p ${prompt_escaped} \
+                -n '${N_PREDICT}' \
+                --ubatch-size '${UBATCH_SIZE}' \
+                --device QNN \
+                --no-warmup \
+                -no-cnv \
+                2> '${REMOTE_LOG_PATH}' | tee '${REMOTE_STDOUT_PATH}'
+        "
+    else
+        retry --success-check remote_run_has_results -- ssh "${HOST}" "
+            mkdir -p '${REMOTE_ROOT}' && \
+            rm -rf '${REMOTE_DUMP_DIR}' && \
+            rm -f '${REMOTE_LOG_PATH}' '${REMOTE_STDOUT_PATH}' && \
+            cd '${REMOTE_ROOT}' && \
+            env \
+              LD_LIBRARY_PATH='${REMOTE_LIB_DIR}:/system/lib64:/vendor/lib64' \
+              ADSP_LIBRARY_PATH='${REMOTE_LIB_DIR}' \
+              GGML_QNN_BIN_PATH='${REMOTE_OPS_DIR}/graph0.bin' \
+              GGML_QNN_RUN_MNN_PREFILL=1 \
+              GGML_QNN_DECODE_LOG_TOKENS=0 \
+              ./bin/llama-cli \
+                -m '${LOCAL_MODEL_PATH}' \
+                -p ${prompt_escaped} \
+                -n '${N_PREDICT}' \
+                --ubatch-size '${UBATCH_SIZE}' \
+                --device QNN \
+                --no-warmup \
+                -no-cnv \
+                2>&1 | tee '${REMOTE_LOG_PATH}'
+        "
+    fi
 }
 
 pull_remote() {
     rm -rf "${LOCAL_PULL_DIR}"
     mkdir -p "${LOCAL_PULL_DIR}"
-    retry rsync -avhP "${HOST}:${REMOTE_DUMP_DIR}/" "${LOCAL_PULL_DIR}/"
+    if ssh "${HOST}" "test -d '${REMOTE_DUMP_DIR}'"; then
+        retry rsync -avhP "${HOST}:${REMOTE_DUMP_DIR}/" "${LOCAL_PULL_DIR}/"
+    fi
     retry rsync -avhP "${HOST}:${REMOTE_LOG_PATH}" "${LOCAL_PULL_DIR}/llama.log"
+    if ssh "${HOST}" "test -f '${REMOTE_STDOUT_PATH}'"; then
+        retry rsync -avhP "${HOST}:${REMOTE_STDOUT_PATH}" "${LOCAL_PULL_DIR}/llama.out"
+    fi
 }
 
 case "${1:-all}" in
@@ -154,6 +244,9 @@ case "${1:-all}" in
     run)
         run_remote
         ;;
+    run-prefill)
+        run_remote_prefill
+        ;;
     pull)
         pull_remote
         ;;
@@ -161,6 +254,12 @@ case "${1:-all}" in
         build_local
         push_bin
         run_remote
+        pull_remote
+        ;;
+    all-prefill)
+        build_local
+        push_bin
+        run_remote_prefill
         pull_remote
         ;;
     help|--help|-h)

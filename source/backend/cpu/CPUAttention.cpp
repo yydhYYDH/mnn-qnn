@@ -8,6 +8,9 @@
 
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
 
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include "CPUAttention.hpp"
 #include "CPUBackend.hpp"
@@ -28,6 +31,156 @@
 
 
 namespace MNN {
+
+static std::string cpuAttentionDumpRoot() {
+    const char* value = ::getenv("MNN_CPU_ATTN_DUMP_DIR");
+    if (value != nullptr && value[0] != '\0') {
+        return value;
+    }
+    value = ::getenv("MNN_QNN_DUMP_DIR");
+    if (value != nullptr && value[0] != '\0') {
+        return value;
+    }
+    return "";
+}
+
+static std::string cpuAttentionDumpFilter() {
+    const char* value = ::getenv("MNN_CPU_ATTN_DUMP_FILTER");
+    if (value == nullptr || value[0] == '\0') {
+        return "";
+    }
+    return value;
+}
+
+static bool cpuAttentionShouldDump(const std::string& opName) {
+    const std::string root = cpuAttentionDumpRoot();
+    if (root.empty()) {
+        return false;
+    }
+    const std::string filter = cpuAttentionDumpFilter();
+    return filter.empty() || opName.find(filter) != std::string::npos;
+}
+
+static std::string cpuAttentionSanitize(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (char c : value) {
+        if ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') ||
+            c == '_' || c == '-' || c == '.') {
+            out.push_back(c);
+        } else {
+            out.push_back('_');
+        }
+    }
+    return out;
+}
+
+static bool cpuAttentionMkdirs(const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+    size_t cursor = 0;
+    while (cursor < path.size()) {
+        cursor = path.find('/', cursor + 1);
+        std::string current = cursor == std::string::npos ? path : path.substr(0, cursor);
+        if (current.empty()) {
+            continue;
+        }
+        if (::mkdir(current.c_str(), 0777) != 0 && errno != EEXIST) {
+            MNN_ERROR("CPUAttention dump mkdir failed for %s errno=%d\n", current.c_str(), errno);
+            return false;
+        }
+        if (cursor == std::string::npos) {
+            break;
+        }
+    }
+    return true;
+}
+
+static void cpuAttentionDumpRawWithMeta(const std::string& dir, const std::string& stem,
+                                        const void* data, size_t size, const char* dtype,
+                                        const std::vector<int>& shape) {
+    if (!cpuAttentionMkdirs(dir)) {
+        return;
+    }
+
+    const std::string safeStem = cpuAttentionSanitize(stem);
+    FILE* raw = ::fopen((dir + "/" + safeStem + ".bin").c_str(), "wb");
+    if (raw == nullptr) {
+        MNN_ERROR("CPUAttention dump failed to open %s.bin\n", safeStem.c_str());
+        return;
+    }
+    if (size > 0 && data != nullptr) {
+        ::fwrite(data, 1, size, raw);
+    }
+    ::fclose(raw);
+
+    FILE* meta = ::fopen((dir + "/" + safeStem + ".meta.txt").c_str(), "w");
+    if (meta == nullptr) {
+        MNN_ERROR("CPUAttention dump failed to open %s.meta.txt\n", safeStem.c_str());
+        return;
+    }
+    ::fprintf(meta, "name=%s\n", stem.c_str());
+    ::fprintf(meta, "dtype=%s\n", dtype ? dtype : "unknown");
+    ::fprintf(meta, "rank=%zu\n", shape.size());
+    ::fprintf(meta, "shape=");
+    for (size_t i = 0; i < shape.size(); ++i) {
+        ::fprintf(meta, "%s%d", i == 0 ? "" : ",", shape[i]);
+    }
+    ::fprintf(meta, "\n");
+    ::fprintf(meta, "bytes=%zu\n", size);
+    ::fclose(meta);
+}
+
+static const char* cpuAttentionTensorDType(const Tensor* tensor) {
+    if (tensor == nullptr) {
+        return "unknown";
+    }
+    const auto& type = tensor->buffer().type;
+    if (type.code == halide_type_float) {
+        if (type.bits == 16) {
+            return "float16";
+        }
+        if (type.bits == 32) {
+            return "float32";
+        }
+    } else if (type.code == halide_type_int) {
+        if (type.bits == 8) {
+            return "int8";
+        }
+        if (type.bits == 16) {
+            return "int16";
+        }
+        if (type.bits == 32) {
+            return "int32";
+        }
+    } else if (type.code == halide_type_uint) {
+        if (type.bits == 8) {
+            return "uint8";
+        }
+        if (type.bits == 16) {
+            return "uint16";
+        }
+        if (type.bits == 32) {
+            return "uint32";
+        }
+    }
+    return "unknown";
+}
+
+static void cpuAttentionDumpDenseTensor(const std::string& dir, const std::string& stem, const Tensor* tensor) {
+    if (tensor == nullptr) {
+        return;
+    }
+    std::unique_ptr<Tensor> hostTensor(Tensor::createHostTensorFromDevice(tensor, true));
+    if (hostTensor == nullptr) {
+        return;
+    }
+    cpuAttentionDumpRawWithMeta(dir, stem, hostTensor->buffer().host, hostTensor->size(),
+                                cpuAttentionTensorDType(hostTensor.get()), hostTensor->shape());
+}
 
 template <typename T>
 static void _maskQK(float * qkPacked, const float* scale, size_t seqLen, size_t processedKvSeq, int pack, int kvSeqLen, int kvoffset, int padKvSeqLen, const float* sinksPtr, const Tensor* mask, bool quantKey, bool isLowerTriangular) {
@@ -296,6 +449,81 @@ ErrorCode CPUAttention::onResize(const std::vector<Tensor*>& inputs, const std::
     return NO_ERROR;
 }
 
+void CPUAttention::dumpPastKVIfNeeded(const Tensor* key, const Tensor* value, int seqLen, int pastLen) {
+    if (!cpuAttentionShouldDump(mOpName) || mKVCacheManager == nullptr) {
+        return;
+    }
+
+    char runName[64];
+    ::snprintf(runName, sizeof(runName), "attention-%s-run-%04zu",
+               cpuAttentionSanitize(mOpName).c_str(), mDumpRunIndex++);
+    const std::string dir = cpuAttentionDumpRoot() + "/" + runName;
+
+    FILE* info = ::fopen((dir + "/attention-info.txt").c_str(), "w");
+    if (info != nullptr) {
+        ::fprintf(info, "op_name=%s\n", mOpName.c_str());
+        ::fprintf(info, "seq_len=%d\n", seqLen);
+        ::fprintf(info, "past_len=%d\n", pastLen);
+        ::fprintf(info, "kv_heads=%d\n", mKvNumHead);
+        ::fprintf(info, "head_dim=%d\n", mHeadDim);
+        ::fprintf(info, "dtype=%s\n", mBytes == 2 ? "float16" : "float32");
+        ::fprintf(info, "flash_attention=%d\n", mUseFlashAttention ? 1 : 0);
+        ::fprintf(info, "quant_key=%d\n", mQuantKey ? 1 : 0);
+        ::fprintf(info, "quant_value=%d\n", mQuantValue ? 1 : 0);
+        ::fclose(info);
+    }
+
+    if (pastLen <= 0 || mQuantKey || mQuantValue) {
+        return;
+    }
+
+    const size_t bytes = (size_t) mBytes;
+    std::vector<uint8_t> pastK((size_t) mKvNumHead * pastLen * mHeadDim * bytes);
+    std::vector<uint8_t> pastV((size_t) mKvNumHead * pastLen * mHeadDim * bytes);
+
+    const size_t keyStride0 = (size_t) ROUND_UP(mHeadDim, lP) * hP;
+    const size_t keyStride1 = (size_t) hP * lP;
+    const int flashBlock = (int) mKVCacheManager->getFlashAttentionBlockKv();
+    const size_t valueStride2 = (size_t) lP * hP;
+    const size_t valueStride1 = (size_t) UP_DIV(flashBlock, lP) * valueStride2;
+    const size_t valueStride0 = valueStride1 * UP_DIV(mHeadDim, hP);
+
+    for (int h = 0; h < mKvNumHead; ++h) {
+        const uint8_t* keyBase = reinterpret_cast<const uint8_t*>(mKVCacheManager->addrOfKey(h));
+        const uint8_t* valueBase = reinterpret_cast<const uint8_t*>(mKVCacheManager->addrOfValue(h));
+        for (int s = 0; s < pastLen; ++s) {
+            for (int d = 0; d < mHeadDim; ++d) {
+                const size_t keyIndex =
+                    (size_t) (s / hP) * keyStride0 +
+                    (size_t) (d / lP) * keyStride1 +
+                    (size_t) (s % hP) * lP +
+                    (size_t) (d % lP);
+                const int seqInBlock = s % flashBlock;
+                const size_t valueIndex =
+                    (size_t) (s / flashBlock) * valueStride0 +
+                    (size_t) (seqInBlock / lP) * valueStride2 +
+                    (size_t) (d / hP) * valueStride1 +
+                    (size_t) (d % hP) * lP +
+                    (size_t) (seqInBlock % lP);
+
+                const size_t dstIndex = ((size_t) h * pastLen + s) * mHeadDim + d;
+                ::memcpy(pastK.data() + dstIndex * bytes, keyBase + keyIndex * bytes, bytes);
+                ::memcpy(pastV.data() + dstIndex * bytes, valueBase + valueIndex * bytes, bytes);
+            }
+        }
+    }
+
+    cpuAttentionDumpRawWithMeta(dir, "attn-state__past_k", pastK.data(), pastK.size(),
+                                mBytes == 2 ? "float16" : "float32",
+                                {1, mKvNumHead, pastLen, mHeadDim});
+    cpuAttentionDumpRawWithMeta(dir, "attn-state__past_v", pastV.data(), pastV.size(),
+                                mBytes == 2 ? "float16" : "float32",
+                                {1, mKvNumHead, pastLen, mHeadDim});
+
+    cpuAttentionDumpDenseTensor(dir, "attn-input__current_k", key);
+    cpuAttentionDumpDenseTensor(dir, "attn-input__current_v", value);
+}
+
 ErrorCode CPUAttention::onExecute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
     auto gcore  = static_cast<CPUBackend *>(backend())->functions();
     auto core   = static_cast<CPUBackend*>(backend())->int8Functions();
@@ -346,6 +574,9 @@ ErrorCode CPUAttention::onExecute(const std::vector<Tensor*>& inputs, const std:
         mKVCacheManager->onClear();
         mKVCacheManager->onAlloc(mMeta, seqLen);
     }
+
+    const int pastLenBeforeUpdate = mKVCacheManager->kvLength();
+    dumpPastKVIfNeeded(key, value, seqLen, pastLenBeforeUpdate);
 
     // Add the new kv to the kvcache
     mKVCacheManager->onUpdateKV(key, value, (int)insertLen);
@@ -802,7 +1033,7 @@ bool CPUAttention::onClone(Backend* bn, const Op* op, Execution** dst) {
     if (nullptr == dst) {
         return true;
     }
-    auto tmp = new CPUAttention(bn, mKVCache);
+    auto tmp = new CPUAttention(bn, mKVCache, mOpName);
     if (bn->getMetaPtr() == mMeta) {
         tmp->mKVCacheManager = mKVCacheManager;
     }
@@ -810,7 +1041,8 @@ bool CPUAttention::onClone(Backend* bn, const Op* op, Execution** dst) {
     return true;
 }
 
-CPUAttention::CPUAttention(Backend *backend, bool kv_cache) : Execution(backend), mKVCache(kv_cache) {
+CPUAttention::CPUAttention(Backend *backend, bool kv_cache, std::string op_name)
+    : Execution(backend), mKVCache(kv_cache), mOpName(std::move(op_name)) {
     mMeta = (KVMeta*)(backend->getMetaPtr());
     mPackQ.reset(Tensor::createDevice<float>({1, 1, 1, 1}));
     mPackQKV.reset(Tensor::createDevice<float>({1, 1, 1, 1}));
@@ -840,7 +1072,8 @@ public:
     virtual Execution* onCreate(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs,
                                 const MNN::Op* op, Backend* backend) const override {
         auto param = op->main_as_AttentionParam();
-        return new CPUAttention(backend, param->kv_cache());
+        const std::string opName = (op != nullptr && op->name() != nullptr) ? op->name()->str() : "";
+        return new CPUAttention(backend, param->kv_cache(), opName);
     }
 };
 
@@ -849,4 +1082,3 @@ REGISTER_CPU_OP_CREATOR_TRANSFORMER(CPUAttentionCreator, OpType_Attention);
 } // namespace MNN
 
 #endif // MNN_SUPPORT_TRANSFORMER_FUSE
-

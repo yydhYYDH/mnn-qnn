@@ -27,6 +27,10 @@
 #endif
 
 namespace MNN {
+namespace plugin {
+class RPCBuffer;
+}
+
 static std::string gExtraIoPrefix = "_mnn";
 
 static std::string qnnDumpSanitize(const std::string& value) {
@@ -144,6 +148,63 @@ static void qnnDumpTensor(const std::string& dir, const char* prefix, const std:
     ::fprintf(meta, "bytes=%d\n", tensor->size());
     ::fclose(meta);
 }
+
+static void qnnDumpRawWithMeta(const std::string& dir, const char* prefix, const std::string& name,
+                               const void* data, size_t size, const char* dtype,
+                               const std::vector<int>& shape) {
+    if (prefix == nullptr) {
+        return;
+    }
+    if (!qnnDumpMkdirs(dir)) {
+        return;
+    }
+
+    const std::string stem = dir + "/" + qnnDumpSanitize(std::string(prefix) + "__" + name);
+    FILE* raw = ::fopen((stem + ".bin").c_str(), "wb");
+    if (raw == nullptr) {
+        MNN_ERROR("MNN_QNN: failed to open %s.bin for write\n", stem.c_str());
+        return;
+    }
+    if (size > 0 && data != nullptr) {
+        ::fwrite(data, 1, size, raw);
+    }
+    ::fclose(raw);
+
+    FILE* meta = ::fopen((stem + ".meta.txt").c_str(), "w");
+    if (meta == nullptr) {
+        MNN_ERROR("MNN_QNN: failed to open %s.meta.txt for write\n", stem.c_str());
+        return;
+    }
+    ::fprintf(meta, "name=%s\n", name.c_str());
+    ::fprintf(meta, "dtype=%s\n", dtype ? dtype : "unknown");
+    ::fprintf(meta, "rank=%zu\n", shape.size());
+    ::fprintf(meta, "shape=");
+    for (size_t i = 0; i < shape.size(); ++i) {
+        ::fprintf(meta, "%s%d", i == 0 ? "" : ",", shape[i]);
+    }
+    ::fprintf(meta, "\n");
+    ::fprintf(meta, "bytes=%zu\n", size);
+    ::fclose(meta);
+}
+
+static std::string qnnStateTensorDebugName(int index, bool isOutput) {
+    if (index == 0) {
+        return isOutput ? "update_k" : "past_k";
+    }
+    if (index == 1) {
+        return isOutput ? "update_v" : "past_v";
+    }
+    char name[32];
+    ::snprintf(name, sizeof(name), "%s_%d", isOutput ? "state_out" : "state_in", index);
+    return name;
+}
+
+static void qnnDumpPackedStateBuffer(const std::string& dir, const char* prefix, const std::string& name,
+                                     const plugin::RPCBuffer* buffer, int outside, int maxLength,
+                                     int validLength, int inside);
+
+static void qnnDumpMaskPrefix(const std::string& dir, const char* prefix, const char* name,
+                              const plugin::RPCBuffer* mask, int validLength);
 
 static std::string qnnDumpGraphRunDir(const std::string& graphName) {
     static std::map<std::string, uint64_t> runIds;
@@ -547,6 +608,40 @@ private:
         mSize = size;
     }
 };
+
+static void qnnDumpPackedStateBuffer(const std::string& dir, const char* prefix, const std::string& name,
+                                     const RPCBuffer* buffer, int outside, int maxLength,
+                                     int validLength, int inside) {
+    if (buffer == nullptr || buffer->mPtr == nullptr || outside <= 0 || maxLength <= 0 || inside <= 0 || validLength < 0) {
+        return;
+    }
+
+    const size_t bytesPerValue = sizeof(__fp16);
+    const size_t srcStride = (size_t) maxLength * inside * bytesPerValue;
+    const size_t dstStride = (size_t) validLength * inside * bytesPerValue;
+    std::vector<uint8_t> packed((size_t) outside * dstStride);
+
+    const uint8_t* srcBase = static_cast<const uint8_t*>(buffer->mPtr);
+    uint8_t* dstBase = packed.empty() ? nullptr : packed.data();
+    for (int i = 0; i < outside; ++i) {
+        if (dstStride == 0) {
+            break;
+        }
+        ::memcpy(dstBase + (size_t) i * dstStride, srcBase + (size_t) i * srcStride, dstStride);
+    }
+
+    qnnDumpRawWithMeta(dir, prefix, name, packed.empty() ? nullptr : packed.data(), packed.size(),
+                       "float16", {1, outside, validLength, inside});
+}
+
+static void qnnDumpMaskPrefix(const std::string& dir, const char* prefix, const char* name,
+                              const RPCBuffer* mask, int validLength) {
+    if (mask == nullptr || mask->mPtr == nullptr || validLength < 0) {
+        return;
+    }
+    const size_t bytes = (size_t) validLength * sizeof(__fp16);
+    qnnDumpRawWithMeta(dir, prefix, name ? name : "mask", mask->mPtr, bytes, "float16", {validLength});
+}
 
 namespace shape_inference {
 class PluginShapeRaw : public InferShapeKernel {
@@ -1345,6 +1440,8 @@ public:
         AUTOTIME;
         int shapeIndex = mShapeIndex;
         std::string graphName = ctx->getAttr("allGraphName")->list()->s()->GetAsString(shapeIndex)->str();
+        const bool shouldDump = qnnShouldDumpGraph(graphName);
+        const std::string dumpDir = shouldDump ? qnnDumpGraphRunDir(graphName) : std::string();
 
         #ifdef QNN_VERBOSE
         MNN_PRINT("Graph name:%s, %d\n", graphName.c_str(), shapeIndex);
@@ -1370,15 +1467,36 @@ public:
                 }
             }
         }
-        mRawExecutor->invokModel(shapeIndex);
 
-        if (qnnShouldDumpGraph(graphName)) {
-            const std::string dumpDir = qnnDumpGraphRunDir(graphName);
+        if (shouldDump) {
             for (int i = 0; i < mInputs.size(); ++i) {
                 qnnDumpTensor(dumpDir, (graphName + "-input").c_str(), mInputs[i].second, mRealInputs[i].get());
             }
+            if (mStateInput.size() > 0) {
+                qnnDumpMaskPrefix(dumpDir, (graphName + "-state-mask").c_str(), "mask", mMask.get(), mStateCurrent);
+                for (int i = 0; i < mStateInput.size(); ++i) {
+                    const auto& state = mStateInput[i];
+                    qnnDumpPackedStateBuffer(dumpDir, (graphName + "-state-input").c_str(),
+                                             qnnStateTensorDebugName(i, false), state.data.get(),
+                                             state.outside, mStateMaxSize, mStateCurrent, state.inside);
+                }
+            }
+        }
+
+        mRawExecutor->invokModel(shapeIndex);
+
+        if (shouldDump) {
             for (int i = 0; i < mOutputs.size(); ++i) {
                 qnnDumpTensor(dumpDir, (graphName + "-output").c_str(), mOutputs[i].second, mRealOutputs[i].get());
+            }
+            const int updateLength = meta != nullptr ? (int) meta->add : (mSeqLen.empty() ? 0 : mSeqLen[mShapeIndex]);
+            if (mStateInput.size() > 0) {
+                for (int i = 0; i < mStateInput.size(); ++i) {
+                    const auto& state = mStateInput[i];
+                    qnnDumpPackedStateBuffer(dumpDir, (graphName + "-state-output").c_str(),
+                                             qnnStateTensorDebugName(i, true), state.update[mShapeIndex].get(),
+                                             state.outside, updateLength, updateLength, state.inside);
+                }
             }
             MNN_PRINT("[MNN_QNN_DUMP] %s dumped to %s\n", graphName.c_str(), dumpDir.c_str());
         }

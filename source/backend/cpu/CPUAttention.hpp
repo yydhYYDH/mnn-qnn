@@ -12,6 +12,7 @@
 #define CPUATTENTION_HPP
 
 #include <functional>
+#include <string>
 #include "core/Execution.hpp"
 #include "core/OpCommonUtils.hpp"
 #include "CPUKVCacheManager.hpp"
@@ -21,12 +22,13 @@ namespace MNN {
 
 class CPUAttention : public Execution {
 public:
-    CPUAttention(Backend *backend, bool kv_cache);
+    CPUAttention(Backend *backend, bool kv_cache, std::string op_name = "");
     virtual ~CPUAttention();
     virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
     virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
     virtual bool onClone(Backend* bn, const Op* op, Execution** dst) override;
 private:
+    void dumpPastKVIfNeeded(const Tensor* key, const Tensor* value, int seqLen, int pastLen);
     bool mKVCache        = true;
     int mBytes = 4;
     int mThreadNum = 1;
@@ -54,6 +56,8 @@ private:
 
     std::function<void(const float*, int8_t*, size_t, const float*, ssize_t, ssize_t, const float*, ssize_t)> mQuantFunc;
     decltype(CoreInt8Functions::Int8GemmKernel) mInt8GemmKernel;
+    std::string mOpName;
+    size_t mDumpRunIndex = 0;
 };
 
 } // namespace MNN
