@@ -1,0 +1,16 @@
+# MNN Project Instructions
+MNN is a lightweight deep learning **inference engine** (not a training framework), targeting mobile and server platforms. Supports CNN / Transformer / LLM / Diffusion models. Code must prioritize **performance and binary size**.
+## Restricted Access
+> The following directories contain internal proprietary code. **Do NOT read, modify, or reference** any files within:
+> - `schema/private/`
+> - `source/internal/`
+## Architecture Overview
+MNN uses a **graph optimization + heterogeneous backend scheduling** architecture.
+Two inference APIs are available:
+- **Session API** (low-level): `Interpreter → createSession → runSession`, operates on Tensor directly
+- **Module API** (high-level, recommended): `Module::load → onForward(VARP)`, Express-based dynamic graph. Used by LLM / Diffusion and most modern workloads
+**Key abstractions** (see corresponding headers under `source/core/`):
+- **Interpreter** / **Session**: model loading and inference session management
+- **Backend** / **Execution**: hardware backend abstraction and per-op implementation (CPU/Metal/CUDA/OpenCL/Vulkan/...)
+- **Tensor**: data container; internally uses NC4HW4 format (channels packed by 4 for SIMD)
+- **Op / Schema**: FlatBuffers-defined operator descriptors (`schema/default/*.fbs`)

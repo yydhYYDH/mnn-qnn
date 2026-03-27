@@ -111,7 +111,7 @@ static bool isEmbeddingModel(const rapidjson::Document& doc) {
         }
     }
     auto modelType = std::string(doc.HasMember("model_type") && doc["model_type"].IsString() ? doc["model_type"].GetString() : "");
-    if (modelType == "bert" || modelType == "new" || modelType == "qwen3") {
+    if (modelType == "bert" || modelType == "new") {
         return true;
     }
     return false;

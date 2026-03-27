@@ -12,6 +12,11 @@
 // #define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
 #include "core/FileLoader.hpp"
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <sys/stat.h>
 // #define QNN_PROFILE_OP
 // #define QNN_PROFILE_SUMMARIZE
 // #define QNN_VERBOSE
@@ -23,6 +28,136 @@
 
 namespace MNN {
 static std::string gExtraIoPrefix = "_mnn";
+
+static std::string qnnDumpSanitize(const std::string& value) {
+    std::string out;
+    out.reserve(value.size());
+    for (char c : value) {
+        if ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') ||
+            c == '_' || c == '-' || c == '.') {
+            out.push_back(c);
+        } else {
+            out.push_back('_');
+        }
+    }
+    return out;
+}
+
+static bool qnnDumpMkdirs(const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+    size_t cursor = 0;
+    while (cursor < path.size()) {
+        cursor = path.find('/', cursor + 1);
+        std::string current = cursor == std::string::npos ? path : path.substr(0, cursor);
+        if (current.empty()) {
+            continue;
+        }
+        if (::mkdir(current.c_str(), 0777) != 0 && errno != EEXIST) {
+            MNN_ERROR("MNN_QNN: mkdir failed for %s errno=%d\n", current.c_str(), errno);
+            return false;
+        }
+        if (cursor == std::string::npos) {
+            break;
+        }
+    }
+    return true;
+}
+
+static const char* qnnDumpDir() {
+    const char* dir = ::getenv("MNN_QNN_DUMP_DIR");
+    if (dir != nullptr && dir[0] != '\0') {
+        return dir;
+    }
+    return ::getenv("MNN_QNN_DUMP_GRAPH0_DIR");
+}
+
+static bool qnnIsDecodeGraphName(const std::string& graphName) {
+    if (graphName.size() <= 5 || graphName.rfind("graph", 0) != 0) {
+        return false;
+    }
+    for (size_t i = 5; i < graphName.size(); ++i) {
+        if (graphName[i] < '0' || graphName[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool qnnShouldDumpGraph(const std::string& graphName) {
+    const char* dir = qnnDumpDir();
+    return dir != nullptr && dir[0] != '\0' && qnnIsDecodeGraphName(graphName);
+}
+
+static const char* qnnDumpTypeName(const halide_type_t& type) {
+    if (type.code == halide_type_float && type.bits == 32) {
+        return "float32";
+    }
+    if (type.code == halide_type_float && type.bits == 16) {
+        return "float16";
+    }
+    if (type.code == halide_type_int && type.bits == 32) {
+        return "int32";
+    }
+    if (type.code == halide_type_uint && type.bits == 32) {
+        return "uint32";
+    }
+    return "unknown";
+}
+
+static void qnnDumpTensor(const std::string& dir, const char* prefix, const std::string& name, const Tensor* tensor) {
+    if (tensor == nullptr || prefix == nullptr) {
+        return;
+    }
+    if (!qnnDumpMkdirs(dir)) {
+        return;
+    }
+
+    const std::string stem = dir + "/" + qnnDumpSanitize(std::string(prefix) + "__" + name);
+    const auto& buffer = tensor->buffer();
+    FILE* raw = ::fopen((stem + ".bin").c_str(), "wb");
+    if (raw == nullptr) {
+        MNN_ERROR("MNN_QNN: failed to open %s.bin for write\n", stem.c_str());
+        return;
+    }
+    if (tensor->size() > 0 && buffer.host != nullptr) {
+        ::fwrite(buffer.host, 1, tensor->size(), raw);
+    }
+    ::fclose(raw);
+
+    FILE* meta = ::fopen((stem + ".meta.txt").c_str(), "w");
+    if (meta == nullptr) {
+        MNN_ERROR("MNN_QNN: failed to open %s.meta.txt for write\n", stem.c_str());
+        return;
+    }
+    ::fprintf(meta, "name=%s\n", name.c_str());
+    ::fprintf(meta, "dtype=%s\n", qnnDumpTypeName(buffer.type));
+    ::fprintf(meta, "rank=%d\n", buffer.dimensions);
+    ::fprintf(meta, "shape=");
+    for (int i = 0; i < buffer.dimensions; ++i) {
+        ::fprintf(meta, "%s%d", i == 0 ? "" : ",", buffer.dim[i].extent);
+    }
+    ::fprintf(meta, "\n");
+    ::fprintf(meta, "bytes=%d\n", tensor->size());
+    ::fclose(meta);
+}
+
+static std::string qnnDumpGraphRunDir(const std::string& graphName) {
+    static std::map<std::string, uint64_t> runIds;
+    char name[64];
+    const uint64_t runId = runIds[graphName]++;
+    ::snprintf(name, sizeof(name), "%s-run-%04llu", graphName.c_str(), (unsigned long long) runId);
+    std::string dir = qnnDumpDir();
+    if (!dir.empty() && dir.back() != '/') {
+        dir.push_back('/');
+    }
+    dir += name;
+    return dir;
+}
+
 namespace QNN {
 struct QnnContext {
     QNN_INTERFACE_VER_TYPE interface{};
@@ -1236,6 +1371,18 @@ public:
             }
         }
         mRawExecutor->invokModel(shapeIndex);
+
+        if (qnnShouldDumpGraph(graphName)) {
+            const std::string dumpDir = qnnDumpGraphRunDir(graphName);
+            for (int i = 0; i < mInputs.size(); ++i) {
+                qnnDumpTensor(dumpDir, (graphName + "-input").c_str(), mInputs[i].second, mRealInputs[i].get());
+            }
+            for (int i = 0; i < mOutputs.size(); ++i) {
+                qnnDumpTensor(dumpDir, (graphName + "-output").c_str(), mOutputs[i].second, mRealOutputs[i].get());
+            }
+            MNN_PRINT("[MNN_QNN_DUMP] %s dumped to %s\n", graphName.c_str(), dumpDir.c_str());
+        }
+
         for (int i=0; i<mOutputs.size(); ++i) {
             ctx->backend()->onCopyBuffer(mRealOutputs[i].get(), outputTensor[i]);
         }

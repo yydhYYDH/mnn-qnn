@@ -9,7 +9,12 @@
 #define MNN_OPEN_TIME_TRACE
 #include <MNN/AutoTime.hpp>
 #include <MNN/expr/ExecutorScope.hpp>
+#include <cerrno>
+#include <cstdint>
 #include <fstream>
+#include <sstream>
+#include <string>
+#include <sys/stat.h>
 #include <sstream>
 #include <stdlib.h>
 #include <initializer_list>
@@ -18,6 +23,94 @@
 #include "audio/audio.hpp"
 #endif
 using namespace MNN::Transformer;
+
+static bool mkdirs_if_needed(const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+    size_t cursor = 0;
+    while (cursor < path.size()) {
+        cursor = path.find('/', cursor + 1);
+        std::string current = cursor == std::string::npos ? path : path.substr(0, cursor);
+        if (current.empty()) {
+            continue;
+        }
+        if (mkdir(current.c_str(), 0777) != 0 && errno != EEXIST) {
+            MNN_ERROR("mkdir failed for %s errno=%d\n", current.c_str(), errno);
+            return false;
+        }
+        if (cursor == std::string::npos) {
+            break;
+        }
+    }
+    return true;
+}
+
+static std::string dump_dir_from_env() {
+    const char* value = getenv("MNN_LLM_DUMP_PROMPT_DIR");
+    if (value == nullptr || value[0] == '\0') {
+        return "";
+    }
+    return value;
+}
+
+static bool dump_only_from_env() {
+    const char* value = getenv("MNN_LLM_DUMP_ONLY");
+    return value != nullptr && value[0] != '\0' &&
+           strcmp(value, "0") != 0 &&
+           strcmp(value, "false") != 0 &&
+           strcmp(value, "False") != 0 &&
+           strcmp(value, "FALSE") != 0;
+}
+
+static void dump_prompt_inputs(Llm* llm, const std::string& prompt, size_t prompt_index) {
+    const std::string dump_dir = dump_dir_from_env();
+    if (dump_dir.empty()) {
+        return;
+    }
+    if (!mkdirs_if_needed(dump_dir)) {
+        return;
+    }
+
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "prompt-%04zu", prompt_index);
+
+    std::ofstream prompt_os(dump_dir + "/" + std::string(prefix) + ".prompt.txt");
+    prompt_os << prompt;
+    prompt_os.close();
+
+    std::vector<int> input_ids = llm->tokenizer_encode(prompt);
+    std::ofstream ids_os(dump_dir + "/" + std::string(prefix) + ".input_ids.txt");
+    for (size_t i = 0; i < input_ids.size(); ++i) {
+        ids_os << input_ids[i] << "\n";
+    }
+    ids_os.close();
+
+    auto embeds = llm->embedding(input_ids);
+    auto info = embeds->getInfo();
+    auto* data = embeds->readMap<float>();
+    if (info == nullptr || data == nullptr) {
+        MNN_ERROR("Failed to map embedding for prompt dump\n");
+        return;
+    }
+
+    const std::string stem = dump_dir + "/" + std::string(prefix) + ".embedding";
+    std::ofstream raw_os(stem + ".bin", std::ios::binary);
+    raw_os.write(reinterpret_cast<const char*>(data), info->size * sizeof(float));
+    raw_os.close();
+
+    std::ofstream meta_os(stem + ".meta.txt");
+    meta_os << "dtype=float32\n";
+    meta_os << "size=" << info->size << "\n";
+    meta_os << "dim=";
+    for (size_t i = 0; i < info->dim.size(); ++i) {
+        meta_os << (i == 0 ? "" : ",") << info->dim[i];
+    }
+    meta_os << "\n";
+    meta_os.close();
+
+    MNN_PRINT("[dump] wrote prompt/input_ids/embedding for prompt %zu to %s\n", prompt_index, dump_dir.c_str());
+}
 
 static void tuning_prepare(Llm* llm) {
     MNN_PRINT("Prepare for tuning opt Begin\n");
@@ -103,6 +196,11 @@ static int benchmark(Llm* llm, const std::vector<std::string>& prompts, int max_
 
         // prompt start with '#' will be ignored
         if (prompt.substr(0, 1) == "#") {
+            continue;
+        }
+
+        dump_prompt_inputs(llm, prompt, static_cast<size_t>(i));
+        if (dump_only_from_env()) {
             continue;
         }
         

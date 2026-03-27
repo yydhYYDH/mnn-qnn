@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+show_usage() {
+    cat <<'EOF'
+Usage: run_mnn_qnn_decode_dump.sh [build|push|run|pull|all]
+
+Environment overrides:
+  HOST                 default: reck
+  RECK_WORKING_DIR     default: /home/reck/mnn_qwen3
+  DEVICE_ROOT          default: /data/local/tmp/MNN
+  LOCAL_PROMPT_FILE    default: transformers/llm/export/prompt-hello.txt
+  DUMP_NAME            default: qnn-dump-hello-full
+  LOCAL_PULL_DIR       default: /tmp/${DUMP_NAME}
+
+Examples:
+  ./run_mnn_qnn_decode_dump.sh all
+  DUMP_NAME=qnn-dump-once ./run_mnn_qnn_decode_dump.sh run
+EOF
+}
+
+retry() {
+    local n=0
+    until "$@"; do
+        n=$((n + 1))
+        if [ "$n" -ge 5 ]; then
+            echo "command failed after ${n} attempts: $*"
+            return 1
+        fi
+        sleep 2
+    done
+}
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ROOT_DIR=$(cd "${SCRIPT_DIR}/../../.." && pwd)
+
+HOST=${HOST:-reck}
+RECK_WORKING_DIR=${RECK_WORKING_DIR:-/home/reck/mnn_qwen3}
+DEVICE_ROOT=${DEVICE_ROOT:-/data/local/tmp/MNN}
+LOCAL_PROMPT_FILE=${LOCAL_PROMPT_FILE:-${ROOT_DIR}/transformers/llm/export/prompt-hello.txt}
+DUMP_NAME=${DUMP_NAME:-qnn-dump-hello-full}
+LOCAL_PULL_DIR=${LOCAL_PULL_DIR:-/tmp/${DUMP_NAME}}
+
+LOCAL_LIB_MNN="${ROOT_DIR}/project/android/build_64/libMNN.so"
+LOCAL_LLM_DEMO="${ROOT_DIR}/project/android/build_64/llm_demo"
+REMOTE_PROMPT_FILE="${RECK_WORKING_DIR}/$(basename "${LOCAL_PROMPT_FILE}")"
+DEVICE_PROMPT_FILE="${DEVICE_ROOT}/$(basename "${LOCAL_PROMPT_FILE}")"
+DEVICE_DUMP_DIR="${DEVICE_ROOT}/${DUMP_NAME}"
+DEVICE_LOG_FILE="${DEVICE_ROOT}/${DUMP_NAME}.log"
+
+build_local() {
+    cmake --build "${ROOT_DIR}/project/android/build_64" --target MNN llm_demo -j 4
+}
+
+push_remote() {
+    retry ssh "${HOST}" "mkdir -p '${RECK_WORKING_DIR}'"
+    retry rsync -avhP "${LOCAL_LIB_MNN}" "${HOST}:${RECK_WORKING_DIR}/libMNN.so"
+    retry rsync -avhP "${LOCAL_LLM_DEMO}" "${HOST}:${RECK_WORKING_DIR}/llm_demo"
+    retry rsync -avhP "${LOCAL_PROMPT_FILE}" "${HOST}:${REMOTE_PROMPT_FILE}"
+
+    retry ssh "${HOST}" "
+        adb push '${RECK_WORKING_DIR}/libMNN.so' '${DEVICE_ROOT}/libMNN.so' && \
+        adb push '${RECK_WORKING_DIR}/llm_demo' '${DEVICE_ROOT}/llm_demo' && \
+        adb push '${REMOTE_PROMPT_FILE}' '${DEVICE_PROMPT_FILE}'
+    "
+}
+
+run_remote() {
+    retry ssh "${HOST}" "
+        adb shell '
+            rm -rf \"${DEVICE_DUMP_DIR}\" \"${DEVICE_LOG_FILE}\" && \
+            cd \"${DEVICE_ROOT}\" && \
+            env \
+              LD_LIBRARY_PATH=\"${DEVICE_ROOT}\" \
+              MNN_QNN_DUMP_DIR=\"${DEVICE_DUMP_DIR}\" \
+              ./llm_demo model/config_qnn_raw.json \"$(basename "${DEVICE_PROMPT_FILE}")\" 2 \
+              > \"${DEVICE_LOG_FILE}\" 2>&1 && \
+            tail -n 80 \"${DEVICE_LOG_FILE}\" && \
+            find \"${DEVICE_DUMP_DIR}\" -maxdepth 2 -type f | sort
+        '
+    "
+}
+
+pull_remote() {
+    rm -rf "${LOCAL_PULL_DIR}"
+    mkdir -p "${LOCAL_PULL_DIR}"
+
+    retry ssh "${HOST}" "
+        rm -rf '${RECK_WORKING_DIR}/${DUMP_NAME}' && \
+        adb pull '${DEVICE_DUMP_DIR}' '${RECK_WORKING_DIR}/' && \
+        adb pull '${DEVICE_LOG_FILE}' '${RECK_WORKING_DIR}/${DUMP_NAME}.log'
+    "
+
+    retry rsync -avhP "${HOST}:${RECK_WORKING_DIR}/${DUMP_NAME}/" "${LOCAL_PULL_DIR}/"
+    retry rsync -avhP "${HOST}:${RECK_WORKING_DIR}/${DUMP_NAME}.log" "${LOCAL_PULL_DIR}/mnn.log"
+
+    echo "Data pulled from: ${HOST}:${RECK_WORKING_DIR}/${DUMP_NAME}/"
+    echo "Log pulled from:  ${HOST}:${RECK_WORKING_DIR}/${DUMP_NAME}.log"
+    echo "Saved to local dir: ${LOCAL_PULL_DIR}/"
+}
+
+case "${1:-all}" in
+    build)
+        build_local
+        ;;
+    push)
+        push_remote
+        ;;
+    run)
+        run_remote
+        ;;
+    pull)
+        pull_remote
+        ;;
+    all)
+        build_local
+        push_remote
+        run_remote
+        pull_remote
+        ;;
+    help|--help|-h)
+        show_usage
+        ;;
+    *)
+        echo "unknown command: $1"
+        show_usage
+        exit 1
+        ;;
+esac
