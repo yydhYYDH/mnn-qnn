@@ -398,3 +398,9 @@ apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen3-0.6B-MNN
 apps/iOS/MNNLLMChat/MNNLLMiOS/LocalModel/Qwen2.5-Omni-3B-MNN
 
 *.bin
+hf_cache
+tmp/
+Qwen3-4B*
+transformers/llm/export/model*
+logs/*
+transformers/llm/export/llm.mnn.weight

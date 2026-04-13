@@ -7,8 +7,17 @@ import struct
 from pathlib import Path
 
 
-RUN_DIR_RE = re.compile(r"^(graph\d+)-run-(\d+)$")
-LLAMA_META_RE = re.compile(r"^(graph\d+)-(input|output)__.+\.meta\.txt$")
+GRAPH_NAME_RE = re.compile(r"^graph\d+(?:_\d+)?$")
+RUN_DIR_RE = re.compile(r"^(graph\d+(?:_\d+)?)-run-(\d+)$")
+LLAMA_META_RE = re.compile(r"^(graph\d+(?:_\d+)?)-(input|output|source)__.+\.meta\.txt$")
+
+
+def graph_sort_key(name: str) -> tuple[int, int]:
+    suffix = name[5:]
+    if "_" in suffix:
+        major, minor = suffix.split("_", 1)
+        return (int(major), int(minor))
+    return (int(suffix), -1)
 
 
 def read_meta(path: Path) -> dict:
@@ -79,7 +88,7 @@ def detect_graphs_and_run_id(mnn_root: Path, llama_dir: Path, requested_graphs: 
     if requested_graphs:
         graphs = [g for g in requested_graphs if g in llama_graphs]
     else:
-        graphs = sorted(llama_graphs, key=lambda x: int(x[5:]))
+        graphs = sorted(llama_graphs, key=graph_sort_key)
 
     run_ids_by_graph: dict[str, set[int]] = {}
     for path in mnn_root.iterdir():
@@ -114,7 +123,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Compare MNN QNN decode dumps against llama.cpp replay dumps.")
     parser.add_argument("--mnn-root", required=True, help="root directory that contains graphN-run-XXXX subdirectories")
     parser.add_argument("--llama-dir", required=True, help="llama.cpp replay token directory")
-    parser.add_argument("--graphs", nargs="*", help="optional subset such as: graph0 graph1 graph2")
+    parser.add_argument("--graphs", nargs="*", help="optional subset such as: graph0 graph1 graph1_1")
     parser.add_argument("--run-id", type=int, help="explicit MNN run id; default auto-detect highest common run id")
     parser.add_argument("--atol", type=float, default=1e-3, help="max allowed absolute difference")
     args = parser.parse_args()

@@ -3,15 +3,19 @@ set -euo pipefail
 
 show_usage() {
     cat <<'EOF'
-Usage: run_mnn_qnn_decode_dump.sh [build|push|run|pull|all]
+Usage: run_mnn_qnn_decode_dump.sh [build|push|run|run-prof|pull|all|all-prof]
 
 Environment overrides:
   HOST                 default: reck
   RECK_WORKING_DIR     default: /home/reck/mnn_qwen3
   DEVICE_ROOT          default: /data/local/tmp/MNN
-  LOCAL_PROMPT_FILE    default: transformers/llm/export/prompt-hello.txt
+    LOCAL_PROMPT_FILE    default: transformers/llm/export/propmt_256.txt
   DUMP_NAME            default: qnn-dump-hello-full
   LOCAL_PULL_DIR       default: /tmp/${DUMP_NAME}
+  N_PREDICT            default: 2
+  PROFILE_STAGE        default: 0
+    MNN_CPU_ATTN_DUMP    default: 0
+    PULL_MODE            default: minimal
 
 Examples:
   ./run_mnn_qnn_decode_dump.sh all
@@ -37,9 +41,13 @@ ROOT_DIR=$(cd "${SCRIPT_DIR}/../../.." && pwd)
 HOST=${HOST:-reck}
 RECK_WORKING_DIR=${RECK_WORKING_DIR:-/home/reck/mnn_qwen3}
 DEVICE_ROOT=${DEVICE_ROOT:-/data/local/tmp/MNN}
-LOCAL_PROMPT_FILE=${LOCAL_PROMPT_FILE:-${ROOT_DIR}/transformers/llm/export/prompt-hello.txt}
+LOCAL_PROMPT_FILE=${LOCAL_PROMPT_FILE:-${ROOT_DIR}/transformers/llm/export/propmt_256.txt}
 DUMP_NAME=${DUMP_NAME:-qnn-dump-hello-full}
 LOCAL_PULL_DIR=${LOCAL_PULL_DIR:-/tmp/${DUMP_NAME}}
+N_PREDICT=${N_PREDICT:-128}
+PROFILE_STAGE=${PROFILE_STAGE:-0}
+MNN_CPU_ATTN_DUMP=${MNN_CPU_ATTN_DUMP:-0}
+PULL_MODE=${PULL_MODE:-minimal}
 
 LOCAL_LIB_MNN="${ROOT_DIR}/project/android/build_64/libMNN.so"
 LOCAL_LLM_DEMO="${ROOT_DIR}/project/android/build_64/llm_demo"
@@ -47,6 +55,7 @@ REMOTE_PROMPT_FILE="${RECK_WORKING_DIR}/$(basename "${LOCAL_PROMPT_FILE}")"
 DEVICE_PROMPT_FILE="${DEVICE_ROOT}/$(basename "${LOCAL_PROMPT_FILE}")"
 DEVICE_DUMP_DIR="${DEVICE_ROOT}/${DUMP_NAME}"
 DEVICE_LOG_FILE="${DEVICE_ROOT}/${DUMP_NAME}.log"
+DEVICE_PROFILE_FILE="${DEVICE_ROOT}/${DUMP_NAME}.stage.tsv"
 
 build_local() {
     cmake --build "${ROOT_DIR}/project/android/build_64" --target MNN llm_demo -j 4
@@ -68,15 +77,33 @@ push_remote() {
 run_remote() {
     retry ssh "${HOST}" "
         adb shell '
-            rm -rf \"${DEVICE_DUMP_DIR}\" \"${DEVICE_LOG_FILE}\" && \
+            rm -rf \"${DEVICE_DUMP_DIR}\" \"${DEVICE_LOG_FILE}\" \"${DEVICE_PROFILE_FILE}\" && \
             cd \"${DEVICE_ROOT}\" && \
             env \
               LD_LIBRARY_PATH=\"${DEVICE_ROOT}\" \
               MNN_QNN_DUMP_DIR=\"${DEVICE_DUMP_DIR}\" \
-              ./llm_demo model/config_qnn_raw.json \"$(basename "${DEVICE_PROMPT_FILE}")\" 2 \
+                            MNN_CPU_ATTN_DUMP=\"${MNN_CPU_ATTN_DUMP}\" \
+              $( [ "${PROFILE_STAGE}" = "1" ] && printf "MNN_QNN_STAGE_PROFILE=\\\"%s\\\" " "${DEVICE_PROFILE_FILE}" ) \
+              ./llm_demo model/config_qnn_raw.json \"$(basename "${DEVICE_PROMPT_FILE}")\" ${N_PREDICT} \
+              2>&1 | tee \"${DEVICE_LOG_FILE}\" 
+              # && 
+            # tail -n 80 \"${DEVICE_LOG_FILE}\" && \
+            # find \"${DEVICE_DUMP_DIR}\" -maxdepth 2 -type f | sort
+        '
+    "
+}
+
+run_remote_profile() {
+    retry ssh "${HOST}" "
+        adb shell '
+            rm -rf \"${DEVICE_DUMP_DIR}\" \"${DEVICE_LOG_FILE}\" \"${DEVICE_PROFILE_FILE}\" && \
+            cd \"${DEVICE_ROOT}\" && \
+            env \
+              LD_LIBRARY_PATH=\"${DEVICE_ROOT}\" \
+              $( [ "${PROFILE_STAGE}" = "1" ] && printf "MNN_QNN_STAGE_PROFILE=\\\"%s\\\" " "${DEVICE_PROFILE_FILE}" ) \
+              ./llm_demo model/config_qnn_raw.json \"$(basename "${DEVICE_PROMPT_FILE}")\" ${N_PREDICT} \
               > \"${DEVICE_LOG_FILE}\" 2>&1 && \
-            tail -n 80 \"${DEVICE_LOG_FILE}\" && \
-            find \"${DEVICE_DUMP_DIR}\" -maxdepth 2 -type f | sort
+            tail -n 80 \"${DEVICE_LOG_FILE}\"
         '
     "
 }
@@ -86,13 +113,31 @@ pull_remote() {
     mkdir -p "${LOCAL_PULL_DIR}"
 
     retry ssh "${HOST}" "
-        rm -rf '${RECK_WORKING_DIR}/${DUMP_NAME}' && \
-        adb pull '${DEVICE_DUMP_DIR}' '${RECK_WORKING_DIR}/' && \
-        adb pull '${DEVICE_LOG_FILE}' '${RECK_WORKING_DIR}/${DUMP_NAME}.log'
+        rm -rf '${RECK_WORKING_DIR}/${DUMP_NAME}' '${RECK_WORKING_DIR}/${DUMP_NAME}.stage.tsv' && \
+        if adb shell test -d '${DEVICE_DUMP_DIR}'; then adb pull '${DEVICE_DUMP_DIR}' '${RECK_WORKING_DIR}/'; fi && \
+        adb pull '${DEVICE_LOG_FILE}' '${RECK_WORKING_DIR}/${DUMP_NAME}.log' && \
+        if adb shell test -f '${DEVICE_PROFILE_FILE}'; then adb pull '${DEVICE_PROFILE_FILE}' '${RECK_WORKING_DIR}/${DUMP_NAME}.stage.tsv'; fi
     "
 
-    retry rsync -avhP "${HOST}:${RECK_WORKING_DIR}/${DUMP_NAME}/" "${LOCAL_PULL_DIR}/"
+    if ssh "${HOST}" "test -d '${RECK_WORKING_DIR}/${DUMP_NAME}'"; then
+        if [ "${PULL_MODE}" = "full" ]; then
+            retry rsync -avhP "${HOST}:${RECK_WORKING_DIR}/${DUMP_NAME}/" "${LOCAL_PULL_DIR}/"
+        else
+            retry rsync -avhP --prune-empty-dirs \
+                --include='*/' \
+                --include='graph*-run-*/**' \
+                --include='prefill/graph*-run-*/**' \
+                --include='prefill/prompt-*' \
+                --include='decode/graph*-run-*/**' \
+                --include='decode/prompt-*' \
+                --exclude='*' \
+                "${HOST}:${RECK_WORKING_DIR}/${DUMP_NAME}/" "${LOCAL_PULL_DIR}/"
+        fi
+    fi
     retry rsync -avhP "${HOST}:${RECK_WORKING_DIR}/${DUMP_NAME}.log" "${LOCAL_PULL_DIR}/mnn.log"
+    if ssh "${HOST}" "test -f '${RECK_WORKING_DIR}/${DUMP_NAME}.stage.tsv'"; then
+        retry rsync -avhP "${HOST}:${RECK_WORKING_DIR}/${DUMP_NAME}.stage.tsv" "${LOCAL_PULL_DIR}/mnn.stage.tsv"
+    fi
 
     echo "Data pulled from: ${HOST}:${RECK_WORKING_DIR}/${DUMP_NAME}/"
     echo "Log pulled from:  ${HOST}:${RECK_WORKING_DIR}/${DUMP_NAME}.log"
@@ -109,6 +154,9 @@ case "${1:-all}" in
     run)
         run_remote
         ;;
+    run-prof)
+        run_remote_profile
+        ;;
     pull)
         pull_remote
         ;;
@@ -116,6 +164,12 @@ case "${1:-all}" in
         build_local
         push_remote
         run_remote
+        pull_remote
+        ;;
+    all-prof)
+        build_local
+        push_remote
+        run_remote_profile
         pull_remote
         ;;
     help|--help|-h)
