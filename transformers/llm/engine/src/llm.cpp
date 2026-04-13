@@ -11,6 +11,9 @@
 #include <sstream>
 #include <iomanip>
 #include <unordered_set>
+#include <cerrno>
+#include <cstdlib>
+#include <sys/stat.h>
 
 #include <MNN/AutoTime.hpp>
 #include "cpp/ExprDebug.hpp"
@@ -32,6 +35,93 @@
 namespace MNN {
 using namespace Express;
 namespace Transformer {
+
+static std::string llmJoinDumpPath(const std::string& base, const std::string& child) {
+    if (base.empty()) {
+        return "";
+    }
+    if (child.empty()) {
+        return base;
+    }
+    if (base.back() == '/') {
+        return base + child;
+    }
+    return base + "/" + child;
+}
+
+static bool llmMkdirsIfNeeded(const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+    size_t cursor = 0;
+    while (cursor < path.size()) {
+        cursor = path.find('/', cursor + 1);
+        std::string current = cursor == std::string::npos ? path : path.substr(0, cursor);
+        if (current.empty()) {
+            continue;
+        }
+        if (::mkdir(current.c_str(), 0777) != 0 && errno != EEXIST) {
+            return false;
+        }
+        if (cursor == std::string::npos) {
+            break;
+        }
+    }
+    return true;
+}
+
+class ScopedDumpChunkEnv {
+public:
+    ScopedDumpChunkEnv() {
+        capture("MNN_QNN_DUMP_DIR", mSavedQnnDumpDir, mHadQnnDumpDir);
+    }
+
+    ~ScopedDumpChunkEnv() {
+        restore("MNN_QNN_DUMP_DIR", mSavedQnnDumpDir, mHadQnnDumpDir);
+    }
+
+    void setChunkPrefillDir(int chunkIndex, int chunkStart, int chunkEnd, int totalPromptTokens, int totalChunks) {
+        if (!mHadQnnDumpDir || mSavedQnnDumpDir.empty()) {
+            return;
+        }
+        char name[64];
+        ::snprintf(name, sizeof(name), "chunk-prefill-%04d", chunkIndex);
+        auto chunkDir = llmJoinDumpPath(mSavedQnnDumpDir, name);
+        ::setenv("MNN_QNN_DUMP_DIR", chunkDir.c_str(), 1);
+        if (!llmMkdirsIfNeeded(chunkDir)) {
+            return;
+        }
+
+        std::ofstream meta(chunkDir + "/chunk-info.txt");
+        if (!meta.good()) {
+            return;
+        }
+        meta << "chunk_index=" << chunkIndex << "\n";
+        meta << "chunk_start=" << chunkStart << "\n";
+        meta << "chunk_end=" << chunkEnd << "\n";
+        meta << "chunk_tokens=" << (chunkEnd - chunkStart) << "\n";
+        meta << "total_prompt_tokens=" << totalPromptTokens << "\n";
+        meta << "total_chunks=" << totalChunks << "\n";
+    }
+
+private:
+    static void capture(const char* name, std::string& saved, bool& hadValue) {
+        const char* value = ::getenv(name);
+        hadValue = value != nullptr;
+        saved = hadValue ? value : "";
+    }
+
+    static void restore(const char* name, const std::string& saved, bool hadValue) {
+        if (hadValue) {
+            ::setenv(name, saved.c_str(), 1);
+        } else {
+            ::unsetenv(name);
+        }
+    }
+
+    std::string mSavedQnnDumpDir;
+    bool mHadQnnDumpDir = false;
+};
 
 void KVMeta::sync() {
     int revertNumber = 0;
@@ -812,6 +902,8 @@ std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens
             }
             std::vector<int> chunk_ids(input_ids.begin() + start, input_ids.begin() + end);
             auto input_embeds = embedding(chunk_ids);
+            ScopedDumpChunkEnv scopedDumpChunkEnv;
+            scopedDumpChunkEnv.setChunkPrefillDir(i, start, end, total_size, loop_size);
             generate(input_embeds, 0);
         }
     } else {

@@ -10,8 +10,8 @@ LOCAL_SCRIPT="transformers/llm/export/compare_qnn_decode_replay.py"
 REMOTE_SCRIPT_PATH="${REMOTE_REPO_PATH}/$(basename "${LOCAL_SCRIPT}")"
 
 # 默认参数（可被命令行覆盖）
-DEFAULT_MNN_ROOT="/home/${REMOTE_USER}/mnn-prefill-compare/prefill/"
-DEFAULT_LLAMA_DIR="/home/${REMOTE_USER}/llama.cpp-test/llama-prefill-compare/decode-token-0000"
+DEFAULT_MNN_PREFILL_ROOT="/home/${REMOTE_USER}/mnn_qwen3/mnn-prefill-compare/prefill"
+DEFAULT_LLAMA_PREFILL_ROOT="/home/${REMOTE_USER}/llama.cpp-test/llama-prefill-compare"
 
 # ===== 函数定义 =====
 print_usage() {
@@ -23,12 +23,15 @@ Commands:
   compare  Run comparison script on ${REMOTE_HOST} with default or provided paths
 
 Options for 'compare':
-  --mnn-root PATH      Path to MNN root (default: ${DEFAULT_MNN_ROOT})
-  --llama-dir PATH     Path to LLaMA decode dir (default: ${DEFAULT_LLAMA_DIR})
+  --chunk-index N      Compare prefill chunk N (default: 0)
+  --run-id N           Explicit MNN run id; defaults to --chunk-index when used
+  --mnn-root PATH      Path to MNN root; overrides --chunk-index default
+  --llama-dir PATH     Path to LLaMA decode dir; overrides --chunk-index default
 
 Example:
   $0 push
   $0 compare
+  $0 compare --chunk-index 1
   $0 compare --mnn-root /custom/mnn --llama-dir /custom/llama
 EOF
 }
@@ -55,12 +58,22 @@ ensure_remote_script() {
 }
 
 run_compare() {
-    local mnn_root="${DEFAULT_MNN_ROOT}"
-    local llama_dir="${DEFAULT_LLAMA_DIR}"
+    local chunk_index="0"
+    local run_id=""
+    local mnn_root=""
+    local llama_dir=""
 
     # 解析命令行参数
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --chunk-index)
+                chunk_index="$2"
+                shift 2
+                ;;
+            --run-id)
+                run_id="$2"
+                shift 2
+                ;;
             --mnn-root)
                 mnn_root="$2"
                 shift 2
@@ -77,6 +90,16 @@ run_compare() {
         esac
     done
 
+    if [[ -z "${mnn_root}" ]]; then
+        mnn_root="${DEFAULT_MNN_PREFILL_ROOT}"
+    fi
+    if [[ -z "${llama_dir}" ]]; then
+        printf -v llama_dir "%s/decode-token-%04d" "${DEFAULT_LLAMA_PREFILL_ROOT}" "${chunk_index}"
+    fi
+    if [[ -z "${run_id}" ]]; then
+        run_id="${chunk_index}"
+    fi
+
     ensure_remote_script
 
     echo "[+] Running comparison:"
@@ -84,13 +107,21 @@ run_compare() {
     echo "    Script: ${REMOTE_SCRIPT_PATH}"
     echo "    --mnn-root: ${mnn_root}"
     echo "    --llama-dir: ${llama_dir}"
+    echo "    --run-id: ${run_id}"
 
     ssh "${REMOTE_USER}@${REMOTE_HOST}" "
-        test -d '${mnn_root}' &&
-        test -d '${llama_dir}' &&
+        if ! test -d '${mnn_root}'; then
+            echo '[compare] missing MNN root: ${mnn_root}' >&2
+            exit 1
+        fi
+        if ! test -d '${llama_dir}'; then
+            echo '[compare] missing llama dir: ${llama_dir}' >&2
+            exit 1
+        fi
         python3 '${REMOTE_SCRIPT_PATH}' \
             --mnn-root '${mnn_root}' \
-            --llama-dir '${llama_dir}'
+            --llama-dir '${llama_dir}' \
+            --run-id '${run_id}'
     "
 }
 

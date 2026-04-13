@@ -79,7 +79,7 @@ static const char* qnnDumpDir() {
     return ::getenv("MNN_QNN_DUMP_GRAPH0_DIR");
 }
 
-static bool qnnIsDecodeGraphName(const std::string& graphName) {
+static bool qnnIsNumericGraphName(const std::string& graphName) {
     if (graphName.size() <= 5 || graphName.rfind("graph", 0) != 0) {
         return false;
     }
@@ -91,9 +91,45 @@ static bool qnnIsDecodeGraphName(const std::string& graphName) {
     return true;
 }
 
+static bool qnnIsPrefillFamilyGraphName(const std::string& graphName) {
+    if (graphName.size() <= 7 || graphName.rfind("graph1_", 0) != 0) {
+        return false;
+    }
+    for (size_t i = 7; i < graphName.size(); ++i) {
+        if (graphName[i] < '0' || graphName[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool qnnDumpDirIsPrefillPhase() {
+    const char* dir = qnnDumpDir();
+    if (dir == nullptr || dir[0] == '\0') {
+        return false;
+    }
+    const std::string dumpDir(dir);
+    return dumpDir.find("/prefill") != std::string::npos ||
+           dumpDir.find("chunk-prefill-") != std::string::npos;
+}
+
+static std::string qnnDumpGraphAlias(const std::string& graphName) {
+    if (qnnIsPrefillFamilyGraphName(graphName)) {
+        return graphName;
+    }
+    if (!qnnDumpDirIsPrefillPhase() || !qnnIsNumericGraphName(graphName)) {
+        return graphName;
+    }
+    return std::string("graph1_") + graphName.substr(5);
+}
+
 static bool qnnShouldDumpGraph(const std::string& graphName) {
     const char* dir = qnnDumpDir();
-    return dir != nullptr && dir[0] != '\0' && qnnIsDecodeGraphName(graphName);
+    if (dir == nullptr || dir[0] == '\0') {
+        return false;
+    }
+    const std::string dumpGraphName = qnnDumpGraphAlias(graphName);
+    return qnnIsNumericGraphName(dumpGraphName) || qnnIsPrefillFamilyGraphName(dumpGraphName);
 }
 
 static const char* qnnDumpTypeName(const halide_type_t& type) {
@@ -208,9 +244,10 @@ static void qnnDumpMaskPrefix(const std::string& dir, const char* prefix, const 
 
 static std::string qnnDumpGraphRunDir(const std::string& graphName) {
     static std::map<std::string, uint64_t> runIds;
+    const std::string dumpGraphName = qnnDumpGraphAlias(graphName);
     char name[64];
-    const uint64_t runId = runIds[graphName]++;
-    ::snprintf(name, sizeof(name), "%s-run-%04llu", graphName.c_str(), (unsigned long long) runId);
+    const uint64_t runId = runIds[dumpGraphName]++;
+    ::snprintf(name, sizeof(name), "%s-run-%04llu", dumpGraphName.c_str(), (unsigned long long) runId);
     std::string dir = qnnDumpDir();
     if (!dir.empty() && dir.back() != '/') {
         dir.push_back('/');
@@ -1440,6 +1477,7 @@ public:
         AUTOTIME;
         int shapeIndex = mShapeIndex;
         std::string graphName = ctx->getAttr("allGraphName")->list()->s()->GetAsString(shapeIndex)->str();
+        const std::string dumpGraphName = qnnDumpGraphAlias(graphName);
         const bool shouldDump = qnnShouldDumpGraph(graphName);
         const std::string dumpDir = shouldDump ? qnnDumpGraphRunDir(graphName) : std::string();
 
@@ -1470,13 +1508,13 @@ public:
 
         if (shouldDump) {
             for (int i = 0; i < mInputs.size(); ++i) {
-                qnnDumpTensor(dumpDir, (graphName + "-input").c_str(), mInputs[i].second, mRealInputs[i].get());
+                qnnDumpTensor(dumpDir, (dumpGraphName + "-input").c_str(), mInputs[i].second, mRealInputs[i].get());
             }
             if (mStateInput.size() > 0) {
-                qnnDumpMaskPrefix(dumpDir, (graphName + "-state-mask").c_str(), "mask", mMask.get(), mStateCurrent);
+                qnnDumpMaskPrefix(dumpDir, (dumpGraphName + "-state-mask").c_str(), "mask", mMask.get(), mStateCurrent);
                 for (int i = 0; i < mStateInput.size(); ++i) {
                     const auto& state = mStateInput[i];
-                    qnnDumpPackedStateBuffer(dumpDir, (graphName + "-state-input").c_str(),
+                    qnnDumpPackedStateBuffer(dumpDir, (dumpGraphName + "-state-input").c_str(),
                                              qnnStateTensorDebugName(i, false), state.data.get(),
                                              state.outside, mStateMaxSize, mStateCurrent, state.inside);
                 }
@@ -1487,18 +1525,18 @@ public:
 
         if (shouldDump) {
             for (int i = 0; i < mOutputs.size(); ++i) {
-                qnnDumpTensor(dumpDir, (graphName + "-output").c_str(), mOutputs[i].second, mRealOutputs[i].get());
+                qnnDumpTensor(dumpDir, (dumpGraphName + "-output").c_str(), mOutputs[i].second, mRealOutputs[i].get());
             }
             const int updateLength = meta != nullptr ? (int) meta->add : (mSeqLen.empty() ? 0 : mSeqLen[mShapeIndex]);
             if (mStateInput.size() > 0) {
                 for (int i = 0; i < mStateInput.size(); ++i) {
                     const auto& state = mStateInput[i];
-                    qnnDumpPackedStateBuffer(dumpDir, (graphName + "-state-output").c_str(),
+                    qnnDumpPackedStateBuffer(dumpDir, (dumpGraphName + "-state-output").c_str(),
                                              qnnStateTensorDebugName(i, true), state.update[mShapeIndex].get(),
                                              state.outside, updateLength, updateLength, state.inside);
                 }
             }
-            MNN_PRINT("[MNN_QNN_DUMP] %s dumped to %s\n", graphName.c_str(), dumpDir.c_str());
+            MNN_PRINT("[MNN_QNN_DUMP] %s dumped as %s to %s\n", graphName.c_str(), dumpGraphName.c_str(), dumpDir.c_str());
         }
 
         for (int i=0; i<mOutputs.size(); ++i) {

@@ -24,6 +24,94 @@
 #endif
 using namespace MNN::Transformer;
 
+static std::string join_dump_path(const std::string& base, const std::string& child) {
+    if (base.empty()) {
+        return "";
+    }
+    if (child.empty()) {
+        return base;
+    }
+    if (base.back() == '/') {
+        return base + child;
+    }
+    return base + "/" + child;
+}
+
+static std::string qnn_dump_base_dir_from_env() {
+    const char* value = getenv("MNN_QNN_DUMP_DIR");
+    if (value != nullptr && value[0] != '\0') {
+        return value;
+    }
+    value = getenv("MNN_QNN_DUMP_GRAPH0_DIR");
+    if (value != nullptr && value[0] != '\0') {
+        return value;
+    }
+    return "";
+}
+
+static std::string prompt_dump_base_dir_from_env() {
+    const char* value = getenv("MNN_LLM_DUMP_PROMPT_DIR");
+    if (value != nullptr && value[0] != '\0') {
+        return value;
+    }
+    return qnn_dump_base_dir_from_env();
+}
+
+static bool prompt_whole_file_from_env() {
+    const char* value = getenv("MNN_LLM_PROMPT_WHOLE_FILE");
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    return ::atoi(value) != 0;
+}
+
+class ScopedDumpEnv {
+public:
+    ScopedDumpEnv() {
+        capture("MNN_QNN_DUMP_DIR", mQnnDumpDirSaved, mQnnDumpDirHadValue);
+        capture("MNN_LLM_DUMP_PROMPT_DIR", mPromptDumpDirSaved, mPromptDumpDirHadValue);
+    }
+
+    ~ScopedDumpEnv() {
+        restore("MNN_QNN_DUMP_DIR", mQnnDumpDirSaved, mQnnDumpDirHadValue);
+        restore("MNN_LLM_DUMP_PROMPT_DIR", mPromptDumpDirSaved, mPromptDumpDirHadValue);
+    }
+
+    void setPhaseDirs(const std::string& qnnBaseDir, const std::string& promptBaseDir, const char* phaseName) {
+        if (phaseName == nullptr || phaseName[0] == '\0') {
+            return;
+        }
+        if (!qnnBaseDir.empty()) {
+            auto qnnPhaseDir = join_dump_path(qnnBaseDir, phaseName);
+            ::setenv("MNN_QNN_DUMP_DIR", qnnPhaseDir.c_str(), 1);
+        }
+        if (!promptBaseDir.empty()) {
+            auto promptPhaseDir = join_dump_path(promptBaseDir, phaseName);
+            ::setenv("MNN_LLM_DUMP_PROMPT_DIR", promptPhaseDir.c_str(), 1);
+        }
+    }
+
+private:
+    static void capture(const char* name, std::string& saved, bool& hadValue) {
+        const char* value = getenv(name);
+        hadValue = value != nullptr;
+        saved = hadValue ? value : "";
+    }
+
+    static void restore(const char* name, const std::string& saved, bool hadValue) {
+        if (hadValue) {
+            ::setenv(name, saved.c_str(), 1);
+        } else {
+            ::unsetenv(name);
+        }
+    }
+
+    std::string mQnnDumpDirSaved;
+    bool mQnnDumpDirHadValue = false;
+    std::string mPromptDumpDirSaved;
+    bool mPromptDumpDirHadValue = false;
+};
+
 static bool mkdirs_if_needed(const std::string& path) {
     if (path.empty()) {
         return false;
@@ -47,11 +135,7 @@ static bool mkdirs_if_needed(const std::string& path) {
 }
 
 static std::string dump_dir_from_env() {
-    const char* value = getenv("MNN_LLM_DUMP_PROMPT_DIR");
-    if (value == nullptr || value[0] == '\0') {
-        return "";
-    }
-    return value;
+    return prompt_dump_base_dir_from_env();
 }
 
 static bool dump_only_from_env() {
@@ -169,6 +253,8 @@ static int benchmark(Llm* llm, const std::vector<std::string>& prompts, int max_
     int64_t sample_time = 0;
     // llm->warmup();
     auto context = llm->getContext();
+    const std::string qnnDumpBaseDir = qnn_dump_base_dir_from_env();
+    const std::string promptDumpBaseDir = prompt_dump_base_dir_from_env();
     if (max_token_number > 0) {
         llm->set_config("{\"max_new_tokens\":1}");
     }
@@ -199,18 +285,23 @@ static int benchmark(Llm* llm, const std::vector<std::string>& prompts, int max_
             continue;
         }
 
+        ScopedDumpEnv scopedDumpEnv;
+        scopedDumpEnv.setPhaseDirs(qnnDumpBaseDir, promptDumpBaseDir, "prefill");
         dump_prompt_inputs(llm, prompt, static_cast<size_t>(i));
         if (dump_only_from_env()) {
             continue;
         }
-        
+
+        llm->response(prompt, &std::cout, nullptr, 0);
+        scopedDumpEnv.setPhaseDirs(qnnDumpBaseDir, promptDumpBaseDir, "decode");
         if (max_token_number >= 0) {
-            llm->response(prompt, &std::cout, nullptr, 0);
             while (!llm->stoped() && context->gen_seq_len < max_token_number) {
                 llm->generate(1);
             }
         } else {
-            llm->response(prompt);
+            while (!llm->stoped()) {
+                llm->generate(1);
+            }
         }
         prompt_len += context->prompt_len;
         decode_len += context->gen_seq_len;
@@ -297,23 +388,36 @@ static int eval(Llm* llm, std::string prompt_file, int max_token_number) {
     std::ifstream prompt_fs(prompt_file);
     std::vector<std::string> prompts;
     std::string prompt;
-//#define LLM_DEMO_ONELINE
-#ifdef LLM_DEMO_ONELINE
-    std::ostringstream tempOs;
-    tempOs << prompt_fs.rdbuf();
-    prompt = tempOs.str();
-    prompts = {prompt};
-#else
-    while (std::getline(prompt_fs, prompt)) {
-        if (prompt.empty()) {
-            continue;
-        }
-        if (prompt.back() == '\r') {
+
+    if (prompt_whole_file_from_env()) {
+        std::ostringstream tempOs;
+        tempOs << prompt_fs.rdbuf();
+        prompt = tempOs.str();
+        if (!prompt.empty() && prompt.back() == '\r') {
             prompt.pop_back();
         }
-        prompts.push_back(prompt);
-    }
+        if (!prompt.empty()) {
+            prompts = {prompt};
+        }
+    } else {
+//#define LLM_DEMO_ONELINE
+#ifdef LLM_DEMO_ONELINE
+        std::ostringstream tempOs;
+        tempOs << prompt_fs.rdbuf();
+        prompt = tempOs.str();
+        prompts = {prompt};
+#else
+        while (std::getline(prompt_fs, prompt)) {
+            if (prompt.empty()) {
+                continue;
+            }
+            if (prompt.back() == '\r') {
+                prompt.pop_back();
+            }
+            prompts.push_back(prompt);
+        }
 #endif
+    }
     prompt_fs.close();
     if (prompts.empty()) {
         return 1;

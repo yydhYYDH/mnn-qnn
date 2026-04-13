@@ -47,6 +47,7 @@ Environment overrides:
     PREFILL_FAMILY_EXECUTOR default: 1; run fallback when FAMILY_EXECUTOR is unset
     PREFILL_FAMILY_PRELOAD  default: 0; run fallback when FAMILY_PRELOAD is unset
     LOAD_EXTRA_MNN_BINS  default: 0, set to 1 to eager-preload auxiliary decode bins for stress testing
+  PUSH_GRAPHS          default: 0; set to 1 to sync graph*.bin to reck staging/device
   PUSH_GRAPH_START     default: 0
   PUSH_GRAPH_END       default: 37
     GGML_QNN_DUMP_ATTENTION default: 0
@@ -240,6 +241,7 @@ PREFILL_FAMILY_PRELOAD=${PREFILL_FAMILY_PRELOAD:-0}
 LOAD_EXTRA_MNN_BINS=${LOAD_EXTRA_MNN_BINS:-0}
 PUSH_GRAPH_START=${PUSH_GRAPH_START:-0}
 PUSH_GRAPH_END=${PUSH_GRAPH_END:-37}
+PUSH_GRAPHS=${PUSH_GRAPHS:-0}
 GGML_QNN_DUMP_ATTENTION=${GGML_QNN_DUMP_ATTENTION:-0}
 PULL_MODE=${PULL_MODE:-minimal}
 PULL_METHOD=${PULL_METHOD:-tar}
@@ -553,20 +555,24 @@ push_bin() {
         if [ -f "${graph_path}" ]; then
             graph_paths+=("${graph_path}")
         fi
+        local prefill_graph_path="${LOCAL_GRAPH_DIR}/graph1_${i}.bin"
+        if [ -f "${prefill_graph_path}" ]; then
+            graph_paths+=("${prefill_graph_path}")
+        fi
     done
 
     if is_adb_mode; then
         retry ssh "${HOST}" "mkdir -p '${REMOTE_STAGE_ROOT}/bin' '${REMOTE_STAGE_ROOT}/build-android' '${REMOTE_STAGE_ROOT}/ops-bin'"
         retry rsync -avhP "${LOCAL_BIN}" "${HOST}:${REMOTE_STAGE_BIN_PATH}"
         # retry rsync -avhP "${LLAMA_ROOT}/build-android/lib/" "${HOST}:${REMOTE_STAGE_ROOT}/build-android/lib/"
-        # if [ "${#graph_paths[@]}" -gt 0 ]; then
-        #     retry rsync -avhP "${graph_paths[@]}" "${HOST}:${REMOTE_STAGE_ROOT}/ops-bin/"
-        # fi
+        if [ "${PUSH_GRAPHS}" = "1" ] && [ "${#graph_paths[@]}" -gt 0 ]; then
+            retry rsync -avhP "${graph_paths[@]}" "${HOST}:${REMOTE_STAGE_ROOT}/ops-bin/"
+        fi
         retry ssh "${HOST}" "adb shell $(device_shell_escape "mkdir -p '${REMOTE_BIN_DIR}' '${REMOTE_LIB_DIR}' '${REMOTE_OPS_DIR}'")"
         echo "adb push '${REMOTE_STAGE_BIN_PATH}' '${REMOTE_BIN_PATH}'"
         retry ssh "${HOST}" "adb push '${REMOTE_STAGE_BIN_PATH}' '${REMOTE_BIN_PATH}'"
         retry ssh "${HOST}" "adb push '${REMOTE_STAGE_ROOT}/build-android/lib/.' '${REMOTE_LIB_DIR}/'"
-        if [ "${#graph_paths[@]}" -gt 0 ]; then
+        if [ "${PUSH_GRAPHS}" = "1" ] && [ "${#graph_paths[@]}" -gt 0 ]; then
             retry ssh "${HOST}" "adb push '${REMOTE_STAGE_ROOT}/ops-bin/.' '${REMOTE_OPS_DIR}/'"
         fi
         if [ "${PUSH_MODEL}" = "1" ]; then
@@ -576,7 +582,7 @@ push_bin() {
     else
         retry ssh "${HOST}" "mkdir -p '${REMOTE_BIN_DIR}' '${REMOTE_OPS_DIR}'"
         retry rsync -avhP "${LOCAL_BIN}" "${HOST}:${REMOTE_BIN_DIR}/llama-cli"
-        if [ "${#graph_paths[@]}" -gt 0 ]; then
+        if [ "${PUSH_GRAPHS}" = "1" ] && [ "${#graph_paths[@]}" -gt 0 ]; then
             retry rsync -avhP "${graph_paths[@]}" "${HOST}:${REMOTE_OPS_DIR}/"
         fi
     fi

@@ -3,7 +3,7 @@ set -euo pipefail
 
 show_usage() {
     cat <<'EOF'
-Usage: run_mnn_qnn_decode_dump.sh [build|push|run|run-prof|pull|all|all-prof]
+Usage: run_mnn_qnn_decode_dump.sh [build|push|run|run-prof|stage-remote|pull|all|all-prof]
 
 Environment overrides:
   HOST                 default: reck
@@ -20,6 +20,7 @@ Environment overrides:
 Examples:
   ./run_mnn_qnn_decode_dump.sh all
   DUMP_NAME=qnn-dump-once ./run_mnn_qnn_decode_dump.sh run
+  DUMP_NAME=qnn-dump-once ./run_mnn_qnn_decode_dump.sh stage-remote
 EOF
 }
 
@@ -48,6 +49,7 @@ N_PREDICT=${N_PREDICT:-128}
 PROFILE_STAGE=${PROFILE_STAGE:-0}
 MNN_CPU_ATTN_DUMP=${MNN_CPU_ATTN_DUMP:-0}
 PULL_MODE=${PULL_MODE:-minimal}
+MNN_LLM_PROMPT_WHOLE_FILE=${MNN_LLM_PROMPT_WHOLE_FILE:-0}
 
 LOCAL_LIB_MNN="${ROOT_DIR}/project/android/build_64/libMNN.so"
 LOCAL_LLM_DEMO="${ROOT_DIR}/project/android/build_64/llm_demo"
@@ -82,7 +84,9 @@ run_remote() {
             env \
               LD_LIBRARY_PATH=\"${DEVICE_ROOT}\" \
               MNN_QNN_DUMP_DIR=\"${DEVICE_DUMP_DIR}\" \
-                            MNN_CPU_ATTN_DUMP=\"${MNN_CPU_ATTN_DUMP}\" \
+              MNN_LLM_DUMP_PROMPT_DIR=\"${DEVICE_DUMP_DIR}\" \
+              MNN_LLM_PROMPT_WHOLE_FILE=\"${MNN_LLM_PROMPT_WHOLE_FILE}\" \
+              MNN_CPU_ATTN_DUMP=\"${MNN_CPU_ATTN_DUMP}\" \
               $( [ "${PROFILE_STAGE}" = "1" ] && printf "MNN_QNN_STAGE_PROFILE=\\\"%s\\\" " "${DEVICE_PROFILE_FILE}" ) \
               ./llm_demo model/config_qnn_raw.json \"$(basename "${DEVICE_PROMPT_FILE}")\" ${N_PREDICT} \
               2>&1 | tee \"${DEVICE_LOG_FILE}\" 
@@ -100,11 +104,22 @@ run_remote_profile() {
             cd \"${DEVICE_ROOT}\" && \
             env \
               LD_LIBRARY_PATH=\"${DEVICE_ROOT}\" \
+              MNN_LLM_PROMPT_WHOLE_FILE=\"${MNN_LLM_PROMPT_WHOLE_FILE}\" \
               $( [ "${PROFILE_STAGE}" = "1" ] && printf "MNN_QNN_STAGE_PROFILE=\\\"%s\\\" " "${DEVICE_PROFILE_FILE}" ) \
               ./llm_demo model/config_qnn_raw.json \"$(basename "${DEVICE_PROMPT_FILE}")\" ${N_PREDICT} \
               > \"${DEVICE_LOG_FILE}\" 2>&1 && \
             tail -n 80 \"${DEVICE_LOG_FILE}\"
         '
+    "
+}
+
+stage_remote() {
+    retry ssh "${HOST}" "
+        mkdir -p '${RECK_WORKING_DIR}' && \
+        rm -rf '${RECK_WORKING_DIR}/${DUMP_NAME}' '${RECK_WORKING_DIR}/${DUMP_NAME}.log' '${RECK_WORKING_DIR}/${DUMP_NAME}.stage.tsv' && \
+        if adb shell test -d '${DEVICE_DUMP_DIR}'; then adb pull '${DEVICE_DUMP_DIR}' '${RECK_WORKING_DIR}/'; fi && \
+        if adb shell test -f '${DEVICE_LOG_FILE}'; then adb pull '${DEVICE_LOG_FILE}' '${RECK_WORKING_DIR}/${DUMP_NAME}.log'; fi && \
+        if adb shell test -f '${DEVICE_PROFILE_FILE}'; then adb pull '${DEVICE_PROFILE_FILE}' '${RECK_WORKING_DIR}/${DUMP_NAME}.stage.tsv'; fi
     "
 }
 
@@ -127,6 +142,7 @@ pull_remote() {
                 --include='*/' \
                 --include='graph*-run-*/**' \
                 --include='prefill/graph*-run-*/**' \
+                --include='prefill/chunk-prefill-*/**' \
                 --include='prefill/prompt-*' \
                 --include='decode/graph*-run-*/**' \
                 --include='decode/prompt-*' \
@@ -156,6 +172,9 @@ case "${1:-all}" in
         ;;
     run-prof)
         run_remote_profile
+        ;;
+    stage-remote)
+        stage_remote
         ;;
     pull)
         pull_remote
