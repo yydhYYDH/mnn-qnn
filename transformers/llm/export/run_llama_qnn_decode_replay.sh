@@ -634,7 +634,7 @@ GGML_QNN_PROFILE='${GGML_QNN_PROFILE}'
 GGML_QNN_DEBUG_DECODE='${GGML_QNN_DEBUG_DECODE}'
 $(stage_profile_env_args)
 GGML_QNN_DECODE_LOG_TOKENS='${GGML_QNN_DECODE_LOG_TOKENS}'"
-    remote_cmd=$(run_remote_cmd 1 "${env_args}" "--ubatch-size '${UBATCH_SIZE}' -ctk f32 -ctk f32 " "${redirect_mode}")
+    remote_cmd=$(run_remote_cmd 1 "${env_args}" "--ubatch-size '${UBATCH_SIZE}' -fa on " "${redirect_mode}")
     run_remote_command "run" "${remote_cmd}"
 }
 # -fa on  -ctk f32 -ctk f32

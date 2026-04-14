@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROMPT_FILE="${PROMPT_FILE:-/home/chensm22/MNN/transformers/llm/export/propmt_80.txt}"
+PROMPT_FILE="${PROMPT_FILE:-/home/chensm22/MNN/transformers/llm/export/propmt_128.txt}"
 HOST="${HOST:-reck}"
 DEVICE_ROOT="${DEVICE_ROOT:-/data/local/tmp/MNN}"
 MNN_DUMP_NAME="${MNN_DUMP_NAME:-mnn-prefill-compare}"
