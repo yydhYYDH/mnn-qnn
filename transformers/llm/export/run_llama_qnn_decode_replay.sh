@@ -3,7 +3,7 @@ set -euo pipefail
 
 show_usage() {
     cat <<'EOF'
-Usage: run_llama_qnn_decode_replay.sh [build|push|run|run-debug|pull|all|all-debug]
+Usage: run_llama_qnn_decode_replay.sh [build|push|run|run-debug|stage-remote|pull|all|all-debug]
 
 Environment overrides:
   HOST                 default: oneplus13
@@ -63,6 +63,7 @@ Examples:
     PROMPT_FILE=/tmp/long.txt N_PREDICT=1 PROFILE_STAGE=1 ./run_llama_qnn_decode_replay.sh run-debug
   PULL_METHOD=rsync ./run_llama_qnn_decode_replay.sh pull  # Use legacy rsync method
   PULL_METHOD=tar ./run_llama_qnn_decode_replay.sh pull    # Use fast tar method (default)
+  ./run_llama_qnn_decode_replay.sh stage-remote           # Stage dump on reck only, no local pull
 
 Notes:
     run is the prefill performance path and does not set GGML_QNN_REPLAY_DUMP_DIR.
@@ -484,8 +485,14 @@ summarize_prefill_profile_local() {
         return 0
     fi
 
+    local summary_script="${SCRIPT_DIR}/analyze_prefill_profile.py"
+    if [ ! -f "${summary_script}" ]; then
+        echo "prefill summary skipped: ${summary_script} not found" >&2
+        return 0
+    fi
+
     echo "prefill stage share summary (${local_profile_path})"
-    python3 "${SCRIPT_DIR}/analyze_prefill_profile.py" \
+    python3 "${summary_script}" \
         "${local_profile_path}" \
         --phase prefill \
         --limit "${PROFILE_LIMIT}"
@@ -904,6 +911,35 @@ pull_remote_rsync() {
     fi
 }
 
+stage_remote() {
+    if is_adb_mode; then
+        retry ssh "${HOST}" "mkdir -p '${REMOTE_STAGE_ROOT}'"
+        retry ssh "${HOST}" "
+            rm -rf '${REMOTE_PULL_DIR}' '${REMOTE_STAGE_ROOT}/${DUMP_NAME}' '${REMOTE_STAGE_ROOT}/${DUMP_NAME}.log' '${REMOTE_STAGE_ROOT}/${DUMP_NAME}.out' '${REMOTE_STAGE_ROOT}/${DUMP_NAME}.stage.tsv' && \
+            mkdir -p '${REMOTE_PULL_DIR}' && \
+            if adb shell test -d '${REMOTE_DUMP_DIR}'; then adb pull '${REMOTE_DUMP_DIR}' '${REMOTE_STAGE_ROOT}/'; fi && \
+            if adb shell test -f '${REMOTE_LOG_PATH}'; then adb pull '${REMOTE_LOG_PATH}' '${REMOTE_STAGE_ROOT}/${DUMP_NAME}.log'; fi && \
+            if adb shell test -f '${REMOTE_STDOUT_PATH}'; then adb pull '${REMOTE_STDOUT_PATH}' '${REMOTE_STAGE_ROOT}/${DUMP_NAME}.out'; fi && \
+            if adb shell test -f '${REMOTE_PROFILE_PATH}'; then adb pull '${REMOTE_PROFILE_PATH}' '${REMOTE_STAGE_ROOT}/${DUMP_NAME}.stage.tsv'; fi && \
+            if [ -d '${REMOTE_STAGE_ROOT}/${DUMP_NAME}' ] && [ '${REMOTE_STAGE_ROOT}/${DUMP_NAME}' != '${REMOTE_PULL_DIR}' ]; then cp -a '${REMOTE_STAGE_ROOT}/${DUMP_NAME}' '${REMOTE_PULL_DIR}/'; fi && \
+            if [ -f '${REMOTE_STAGE_ROOT}/${DUMP_NAME}.log' ]; then cp -f '${REMOTE_STAGE_ROOT}/${DUMP_NAME}.log' '${REMOTE_PULL_DIR}/llama.log'; fi && \
+            if [ -f '${REMOTE_STAGE_ROOT}/${DUMP_NAME}.out' ]; then cp -f '${REMOTE_STAGE_ROOT}/${DUMP_NAME}.out' '${REMOTE_PULL_DIR}/llama.out'; fi && \
+            if [ -f '${REMOTE_STAGE_ROOT}/${DUMP_NAME}.stage.tsv' ]; then cp -f '${REMOTE_STAGE_ROOT}/${DUMP_NAME}.stage.tsv' '${REMOTE_PULL_DIR}/llama.stage.tsv'; fi
+        "
+        echo "[stage-remote] Remote staging completed: ${HOST}:${REMOTE_PULL_DIR}"
+    else
+        retry ssh "${HOST}" "
+            rm -rf '${REMOTE_PULL_DIR}' && \
+            mkdir -p '${REMOTE_PULL_DIR}' && \
+            if [ -d '${REMOTE_DUMP_DIR}' ]; then cp -a '${REMOTE_DUMP_DIR}' '${REMOTE_PULL_DIR}/'; fi && \
+            if [ -f '${REMOTE_LOG_PATH}' ]; then cp -f '${REMOTE_LOG_PATH}' '${REMOTE_PULL_DIR}/llama.log'; fi && \
+            if [ -f '${REMOTE_STDOUT_PATH}' ]; then cp -f '${REMOTE_STDOUT_PATH}' '${REMOTE_PULL_DIR}/llama.out'; fi && \
+            if [ -f '${REMOTE_PROFILE_PATH}' ]; then cp -f '${REMOTE_PROFILE_PATH}' '${REMOTE_PULL_DIR}/llama.stage.tsv'; fi
+        "
+        echo "[stage-remote] Remote staging completed: ${HOST}:${REMOTE_PULL_DIR}"
+    fi
+}
+
 # Main pull function that delegates to the appropriate method
 pull_remote() {
     case "${PULL_METHOD}" in
@@ -941,6 +977,9 @@ case "${1:-all}" in
         ;;
     run-debug)
         run_remote_debug
+        ;;
+    stage-remote)
+        stage_remote
         ;;
     pull)
         pull_remote

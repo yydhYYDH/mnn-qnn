@@ -65,6 +65,10 @@ static bool prompt_whole_file_from_env() {
     return ::atoi(value) != 0;
 }
 
+static bool skip_tuning_for_dump_from_env() {
+    return !qnn_dump_base_dir_from_env().empty();
+}
+
 class ScopedDumpEnv {
 public:
     ScopedDumpEnv() {
@@ -197,6 +201,10 @@ static void dump_prompt_inputs(Llm* llm, const std::string& prompt, size_t promp
 }
 
 static void tuning_prepare(Llm* llm) {
+    if (skip_tuning_for_dump_from_env()) {
+        MNN_PRINT("Skip tuning because QNN dump is enabled\n");
+        return;
+    }
     MNN_PRINT("Prepare for tuning opt Begin\n");
     llm->tuning(OP_ENCODER_NUMBER, {1, 5, 10, 20, 30, 50, 100});
     MNN_PRINT("Prepare for tuning opt End\n");

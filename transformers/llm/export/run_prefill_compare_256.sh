@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROMPT_FILE="${PROMPT_FILE:-/home/chensm22/MNN/transformers/llm/export/propmt_256_0.txt}"
+PROMPT_FILE="${PROMPT_FILE:-/home/chensm22/MNN/transformers/llm/export/propmt_80.txt}"
 HOST="${HOST:-reck}"
 DEVICE_ROOT="${DEVICE_ROOT:-/data/local/tmp/MNN}"
 MNN_DUMP_NAME="${MNN_DUMP_NAME:-mnn-prefill-compare}"
 LLAMA_DUMP_NAME="${LLAMA_DUMP_NAME:-llama-prefill-compare}"
+
+cat <<EOF
+[0/6] Remove existing prefill dumps
+EOF
+ssh reck 'rm -rf /home/reck/mnn_qwen3/mnn-prefill-compare /home/reck/llama.cpp-test/llama-prefill-compare'
 
 cat <<EOF
 [1/6] Build MNN android binaries
@@ -58,7 +63,7 @@ DUMP_NAME="${MNN_DUMP_NAME}" \
 HOST="${HOST}" \
 DEVICE_ROOT="${DEVICE_ROOT}" \
 DUMP_NAME="${LLAMA_DUMP_NAME}" \
-/home/chensm22/MNN/transformers/llm/export/run_llama_qnn_decode_replay.sh pull
+/home/chensm22/MNN/transformers/llm/export/run_llama_qnn_decode_replay.sh stage-remote
 
 cat <<EOF
 [6/7] Compare prefill chunk 0
