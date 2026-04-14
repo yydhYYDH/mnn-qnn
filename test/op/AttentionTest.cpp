@@ -12,7 +12,13 @@
 #include "core/OpCommonUtils.hpp"
 #include "MNNTestSuite.h"
 #include "TestUtils.h"
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <string>
 #include <vector>
 #include <MNN/AutoTime.hpp>
 
@@ -57,6 +63,155 @@ struct KVMeta {
 };
 
 static KVMeta gMeta;
+
+static const char* _getEnvOrDefault(const char* key, const char* fallback) {
+    auto value = ::getenv(key);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    return value;
+}
+
+static int _getEnvInt(const char* key, int fallback) {
+    auto value = ::getenv(key);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+    return atoi(value);
+}
+
+static float _deterministicValue(size_t index, int salt) {
+    const uint64_t x = static_cast<uint64_t>(index);
+    const int term0 = static_cast<int>((x * 17 + static_cast<uint64_t>(salt) * 13) % 127) - 63;
+    const int term1 = static_cast<int>((x * 11 + static_cast<uint64_t>(salt) * 7) % 31) - 15;
+    return term0 * (1.0f / 32.0f) + term1 * (1.0f / 1024.0f);
+}
+
+static bool _mkdirs(const std::string& path) {
+    if (path.empty()) {
+        return true;
+    }
+    size_t cursor = 0;
+    while (cursor < path.size()) {
+        cursor = path.find('/', cursor + 1);
+        auto current = cursor == std::string::npos ? path : path.substr(0, cursor);
+        if (current.empty()) {
+            continue;
+        }
+        if (::mkdir(current.c_str(), 0777) != 0 && errno != EEXIST) {
+            MNN_ERROR("mkdir failed for %s errno=%d\n", current.c_str(), errno);
+            return false;
+        }
+        if (cursor == std::string::npos) {
+            break;
+        }
+    }
+    return true;
+}
+
+static bool _dumpRawTensor(const std::string& dir, const std::string& name, const float* data, size_t numel, const std::vector<int>& shape) {
+    if (!_mkdirs(dir)) {
+        return false;
+    }
+    const auto binPath = dir + "/" + name + ".bin";
+    const auto metaPath = dir + "/" + name + ".meta.txt";
+    auto fp = ::fopen(binPath.c_str(), "wb");
+    if (fp == nullptr) {
+        MNN_ERROR("open failed for %s\n", binPath.c_str());
+        return false;
+    }
+    if (numel > 0 && data != nullptr) {
+        ::fwrite(data, sizeof(float), numel, fp);
+    }
+    ::fclose(fp);
+
+    fp = ::fopen(metaPath.c_str(), "w");
+    if (fp == nullptr) {
+        MNN_ERROR("open failed for %s\n", metaPath.c_str());
+        return false;
+    }
+    ::fprintf(fp, "name=%s\n", name.c_str());
+    ::fprintf(fp, "dtype=f32\n");
+    ::fprintf(fp, "rank=%zu\n", shape.size());
+    ::fprintf(fp, "shape=");
+    for (size_t i = 0; i < shape.size(); ++i) {
+        ::fprintf(fp, "%s%d", i == 0 ? "" : ",", shape[i]);
+    }
+    ::fprintf(fp, "\nbytes=%zu\n", numel * sizeof(float));
+    ::fclose(fp);
+    return true;
+}
+
+static bool _readMetaShape(const std::string& metaPath, std::vector<int>& shape) {
+    auto fp = ::fopen(metaPath.c_str(), "r");
+    if (fp == nullptr) {
+        MNN_ERROR("open failed for %s\n", metaPath.c_str());
+        return false;
+    }
+
+    shape.clear();
+    char line[1024];
+    while (::fgets(line, sizeof(line), fp) != nullptr) {
+        if (::strncmp(line, "shape=", 6) != 0) {
+            continue;
+        }
+        char* cursor = line + 6;
+        while (*cursor != '\0') {
+            char* end = nullptr;
+            const long value = ::strtol(cursor, &end, 10);
+            if (cursor == end) {
+                break;
+            }
+            shape.emplace_back(static_cast<int>(value));
+            if (*end == ',') {
+                cursor = end + 1;
+                continue;
+            }
+            break;
+        }
+        break;
+    }
+
+    ::fclose(fp);
+    if (shape.empty()) {
+        MNN_ERROR("missing shape in %s\n", metaPath.c_str());
+        return false;
+    }
+    return true;
+}
+
+static bool _readF32Tensor(const std::string& dir, const std::string& name, std::vector<int>& shape, std::vector<float>& data) {
+    const auto metaPath = dir + "/" + name + ".meta.txt";
+    const auto binPath = dir + "/" + name + ".bin";
+    if (!_readMetaShape(metaPath, shape)) {
+        return false;
+    }
+
+    size_t numel = 1;
+    for (auto dim : shape) {
+        if (dim <= 0) {
+            MNN_ERROR("invalid dim=%d in %s\n", dim, metaPath.c_str());
+            return false;
+        }
+        numel *= static_cast<size_t>(dim);
+    }
+
+    auto fp = ::fopen(binPath.c_str(), "rb");
+    if (fp == nullptr) {
+        MNN_ERROR("open failed for %s\n", binPath.c_str());
+        return false;
+    }
+
+    data.resize(numel);
+    const auto readCount = ::fread(data.data(), sizeof(float), numel, fp);
+    ::fclose(fp);
+    if (readCount != numel) {
+        MNN_ERROR("read failed for %s expected=%zu got=%zu\n", binPath.c_str(), numel, readCount);
+        return false;
+    }
+    return true;
+}
+
 static std::shared_ptr<Module> _makeAttentionModule(int attentionMode = 8) {
     auto Q = _Input();
     auto K = _Input();
@@ -601,6 +756,159 @@ SpeedAttentionTest() = default;
     }
 };
 
+class AttentionUnitDumpTest : public MNNTestCase {
+public:
+    AttentionUnitDumpTest() = default;
+    virtual ~AttentionUnitDumpTest() = default;
+
+    bool run(int precision) override {
+        (void)precision;
+        const std::string dumpDir = _getEnvOrDefault("MNN_ATTN_UNIT_DUMP_DIR", "");
+        if (dumpDir.empty()) {
+            MNN_ERROR("MNN_ATTN_UNIT_DUMP_DIR is empty\n");
+            return false;
+        }
+        const std::string inputDir = _getEnvOrDefault("MNN_ATTN_UNIT_INPUT_DIR", "");
+
+        int seqLen = _getEnvInt("MNN_ATTN_UNIT_SEQ_LEN", 32);
+        int kvLen = _getEnvInt("MNN_ATTN_UNIT_KV_LEN", seqLen);
+        int numHeads = _getEnvInt("MNN_ATTN_UNIT_NUM_HEADS", 32);
+        int kvNumHeads = _getEnvInt("MNN_ATTN_UNIT_NUM_KV_HEADS", numHeads);
+        int headDim = _getEnvInt("MNN_ATTN_UNIT_HEAD_DIM", 128);
+        const int attentionOption = _getEnvInt("MNN_ATTN_UNIT_ATTENTION_OPTION", 8);
+
+        if (seqLen <= 0 || kvLen <= 0 || numHeads <= 0 || kvNumHeads <= 0 || headDim <= 0) {
+            MNN_ERROR("invalid attention unit dump shape\n");
+            return false;
+        }
+        if (numHeads % kvNumHeads != 0) {
+            MNN_ERROR("num_heads=%d must be divisible by kv_num_heads=%d\n", numHeads, kvNumHeads);
+            return false;
+        }
+
+        NumHead = numHeads;
+        KvNumHead = kvNumHeads;
+        HeadDim = headDim;
+
+        std::vector<float> queryData;
+        std::vector<float> keyData;
+        std::vector<float> valueData;
+        if (!inputDir.empty()) {
+            std::vector<int> qShape;
+            std::vector<int> kShape;
+            std::vector<int> vShape;
+            if (!_readF32Tensor(inputDir, "attn-query", qShape, queryData) ||
+                !_readF32Tensor(inputDir, "attn-key", kShape, keyData) ||
+                !_readF32Tensor(inputDir, "attn-value", vShape, valueData)) {
+                return false;
+            }
+            if (qShape.size() != 4 || kShape.size() != 4 || vShape.size() != 4) {
+                MNN_ERROR("attention unit input tensors must be rank-4\n");
+                return false;
+            }
+            if (qShape[0] != 1 || kShape[0] != 1 || vShape[0] != 1) {
+                MNN_ERROR("attention unit input tensors currently require batch=1\n");
+                return false;
+            }
+            if (kShape != vShape) {
+                MNN_ERROR("attn-key and attn-value shape mismatch\n");
+                return false;
+            }
+            if (qShape[3] != kShape[3]) {
+                MNN_ERROR("q head_dim=%d != kv head_dim=%d\n", qShape[3], kShape[3]);
+                return false;
+            }
+            seqLen = qShape[1];
+            kvLen = kShape[1];
+            numHeads = qShape[2];
+            kvNumHeads = kShape[2];
+            headDim = qShape[3];
+            if (numHeads % kvNumHeads != 0) {
+                MNN_ERROR("num_heads=%d must be divisible by kv_num_heads=%d\n", numHeads, kvNumHeads);
+                return false;
+            }
+            NumHead = numHeads;
+            KvNumHead = kvNumHeads;
+            HeadDim = headDim;
+        } else {
+            const size_t qNumel = static_cast<size_t>(seqLen) * numHeads * headDim;
+            const size_t kvNumel = static_cast<size_t>(kvLen) * kvNumHeads * headDim;
+            queryData.resize(qNumel);
+            keyData.resize(kvNumel);
+            valueData.resize(kvNumel);
+            size_t index = 0;
+            for (size_t i = 0; i < qNumel; ++i, ++index) {
+                queryData[i] = _deterministicValue(index, 1);
+            }
+            index = 0;
+            for (size_t i = 0; i < kvNumel; ++i, ++index) {
+                keyData[i] = _deterministicValue(index, 2);
+                valueData[i] = _deterministicValue(index, 3);
+            }
+        }
+
+        auto Query = _Input({1, seqLen, numHeads, headDim}, NCHW, halide_type_of<float>());
+        auto Key = _Input({1, kvLen, kvNumHeads, headDim}, NCHW, halide_type_of<float>());
+        auto Value = _Input({1, kvLen, kvNumHeads, headDim}, NCHW, halide_type_of<float>());
+        ::memcpy(Query->writeMap<float>(), queryData.data(), queryData.size() * sizeof(float));
+        ::memcpy(Key->writeMap<float>(), keyData.data(), keyData.size() * sizeof(float));
+        ::memcpy(Value->writeMap<float>(), valueData.data(), valueData.size() * sizeof(float));
+        auto Mask = _Input({}, NCHW, halide_type_of<float>());
+        Mask->writeMap<float>()[0] = 0.0f;
+
+        gMeta = KVMeta();
+        gMeta.add = seqLen;
+        auto attn = _makeAttentionModule(attentionOption);
+        auto Output = attn->onForward({Query, Key, Value, Mask})[0];
+        gMeta.sync();
+
+        if (Output->getInfo()->type.code != halide_type_float) {
+            Output = _Cast<float>(Output);
+        }
+        Output.fix(VARP::CONSTANT);
+
+        auto outputPtr = Output->readMap<float>();
+        auto queryPtr = Query->readMap<float>();
+        auto keyPtr = Key->readMap<float>();
+        auto valuePtr = Value->readMap<float>();
+        auto maskValue = Mask->readMap<float>()[0];
+
+        std::vector<float> maskData(seqLen * kvLen, 0.0f);
+        for (int row = 0; row < seqLen; ++row) {
+            for (int col = 0; col < kvLen; ++col) {
+                maskData[row * kvLen + col] = (col <= row) ? 0.0f : std::numeric_limits<float>::lowest();
+            }
+        }
+
+        const size_t qNumel = static_cast<size_t>(seqLen) * numHeads * headDim;
+        const size_t kvNumel = static_cast<size_t>(kvLen) * kvNumHeads * headDim;
+        const size_t outNumel = qNumel;
+        bool ok = true;
+        ok = ok && _dumpRawTensor(dumpDir, "attn-query", queryPtr, qNumel, {1, seqLen, numHeads, headDim});
+        ok = ok && _dumpRawTensor(dumpDir, "attn-key", keyPtr, kvNumel, {1, kvLen, kvNumHeads, headDim});
+        ok = ok && _dumpRawTensor(dumpDir, "attn-value", valuePtr, kvNumel, {1, kvLen, kvNumHeads, headDim});
+        ok = ok && _dumpRawTensor(dumpDir, "attn-mask", maskData.data(), maskData.size(), {1, 1, seqLen, kvLen});
+        ok = ok && _dumpRawTensor(dumpDir, "attn-output", outputPtr, outNumel, {1, seqLen, numHeads, headDim});
+
+        Query->unMap();
+        Key->unMap();
+        Value->unMap();
+        Mask->unMap();
+        Output->unMap();
+
+        if (!ok) {
+            return false;
+        }
+
+        MNN_PRINT("MNN attention unit dump finished\n");
+        MNN_PRINT("seq_len=%d kv_len=%d num_heads=%d kv_num_heads=%d head_dim=%d attention_option=%d mask_scalar=%f\n",
+                  seqLen, kvLen, numHeads, kvNumHeads, headDim, attentionOption, maskValue);
+        MNN_PRINT("dump_dir=%s\n", dumpDir.c_str());
+        return true;
+    }
+};
+
 MNNTestSuiteRegister(AttentionTest, "op/attention");
+MNNTestSuiteRegister(AttentionUnitDumpTest, "op/attention_unit_dump");
 MNNTestSuiteRegister(SpeedAttentionTest, "speed/attention");
 #endif

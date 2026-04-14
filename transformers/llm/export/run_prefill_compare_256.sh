@@ -74,3 +74,17 @@ cat <<EOF
 [7/7] Compare prefill chunk 1
 EOF
 /home/chensm22/MNN/transformers/llm/export/run_compare.sh compare --chunk-index 1
+
+if [ "${RUN_ATTN_UNIT_COMPARE_FROM_PREFILL:-0}" = "1" ]; then
+cat <<EOF
+[8/8] Replay prefill q/k/v through attention unit compare
+EOF
+INPUT_MODE="prefill" \
+ATTN_INPUT_SOURCE_KIND="${ATTN_INPUT_SOURCE_KIND:-llama}" \
+ATTN_INPUT_SOURCE_ROOT="${ATTN_INPUT_SOURCE_ROOT:-}" \
+ATTN_INPUT_GRAPH="${ATTN_INPUT_GRAPH:-}" \
+ATTN_INPUT_RUN_ID="${ATTN_INPUT_RUN_ID:-0}" \
+HOST="${HOST}" \
+DEVICE_ROOT="${DEVICE_ROOT}" \
+/home/chensm22/MNN/transformers/llm/export/run_attention_unit_compare.sh
+fi

@@ -65,6 +65,9 @@ list(APPEND MNN_CPP_TOOLS getPerformance.out)
 add_executable(checkInvalidValue.out ${CMAKE_CURRENT_LIST_DIR}/checkInvalidValue.cpp)
 list(APPEND MNN_CPP_TOOLS checkInvalidValue.out)
 
+add_executable(attentionUnitTest.out ${CMAKE_CURRENT_LIST_DIR}/attentionUnitTest.cpp)
+list(APPEND MNN_CPP_TOOLS attentionUnitTest.out)
+
 add_executable(timeProfile.out ${CMAKE_CURRENT_LIST_DIR}/timeProfile.cpp ${CMAKE_CURRENT_LIST_DIR}/revertMNNModel.cpp ${CMAKE_CURRENT_LIST_DIR}/Profiler.cpp)
 list(APPEND MNN_CPP_TOOLS timeProfile.out)
 

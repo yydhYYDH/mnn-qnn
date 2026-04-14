@@ -404,3 +404,4 @@ Qwen3-4B*
 transformers/llm/export/model*
 logs/*
 transformers/llm/export/llm.mnn.weight
+.tmp/*
