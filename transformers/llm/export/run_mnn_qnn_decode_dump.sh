@@ -52,6 +52,8 @@ PULL_MODE=${PULL_MODE:-minimal}
 MNN_LLM_PROMPT_WHOLE_FILE=${MNN_LLM_PROMPT_WHOLE_FILE:-0}
 
 LOCAL_LIB_MNN="${ROOT_DIR}/project/android/build_64/libMNN.so"
+LOCAL_LIB_MNN_EXPRESS="${ROOT_DIR}/project/android/build_64/libMNN_Express.so"
+LOCAL_LIB_LLM="${ROOT_DIR}/project/android/build_64/libllm.so"
 LOCAL_LLM_DEMO="${ROOT_DIR}/project/android/build_64/llm_demo"
 REMOTE_PROMPT_FILE="${RECK_WORKING_DIR}/$(basename "${LOCAL_PROMPT_FILE}")"
 DEVICE_PROMPT_FILE="${DEVICE_ROOT}/$(basename "${LOCAL_PROMPT_FILE}")"
@@ -64,13 +66,32 @@ build_local() {
 }
 
 push_remote() {
+    local runtime_files=(
+        "${LOCAL_LIB_MNN}"
+        "${LOCAL_LIB_MNN_EXPRESS}"
+        "${LOCAL_LIB_LLM}"
+        "${LOCAL_LLM_DEMO}"
+    )
+
+    local local_file
+    for local_file in "${runtime_files[@]}"; do
+        if [ ! -f "${local_file}" ]; then
+            echo "missing runtime artifact: ${local_file}"
+            return 1
+        fi
+    done
+
     retry ssh "${HOST}" "mkdir -p '${RECK_WORKING_DIR}'"
     retry rsync -avhP "${LOCAL_LIB_MNN}" "${HOST}:${RECK_WORKING_DIR}/libMNN.so"
+    retry rsync -avhP "${LOCAL_LIB_MNN_EXPRESS}" "${HOST}:${RECK_WORKING_DIR}/libMNN_Express.so"
+    retry rsync -avhP "${LOCAL_LIB_LLM}" "${HOST}:${RECK_WORKING_DIR}/libllm.so"
     retry rsync -avhP "${LOCAL_LLM_DEMO}" "${HOST}:${RECK_WORKING_DIR}/llm_demo"
     retry rsync -avhP "${LOCAL_PROMPT_FILE}" "${HOST}:${REMOTE_PROMPT_FILE}"
 
     retry ssh "${HOST}" "
         adb push '${RECK_WORKING_DIR}/libMNN.so' '${DEVICE_ROOT}/libMNN.so' && \
+        adb push '${RECK_WORKING_DIR}/libMNN_Express.so' '${DEVICE_ROOT}/libMNN_Express.so' && \
+        adb push '${RECK_WORKING_DIR}/libllm.so' '${DEVICE_ROOT}/libllm.so' && \
         adb push '${RECK_WORKING_DIR}/llm_demo' '${DEVICE_ROOT}/llm_demo' && \
         adb push '${REMOTE_PROMPT_FILE}' '${DEVICE_PROMPT_FILE}'
     "
