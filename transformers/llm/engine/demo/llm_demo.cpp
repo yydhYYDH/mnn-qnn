@@ -295,7 +295,7 @@ static int benchmark(Llm* llm, const std::vector<std::string>& prompts, int max_
 
         ScopedDumpEnv scopedDumpEnv;
         scopedDumpEnv.setPhaseDirs(qnnDumpBaseDir, promptDumpBaseDir, "prefill");
-        dump_prompt_inputs(llm, prompt, static_cast<size_t>(i));
+        // dump_prompt_inputs(llm, prompt, static_cast<size_t>(i));
         if (dump_only_from_env()) {
             continue;
         }

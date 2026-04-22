@@ -140,7 +140,8 @@ def compare(lhs: list[float], rhs: list[float]) -> tuple[float, float, float]:
 
     rmse = math.sqrt(sum_sq / len(lhs)) if lhs else 0.0
     cosine = dot / (math.sqrt(lhs_sq) * math.sqrt(rhs_sq)) if lhs_sq > 0 and rhs_sq > 0 else float("nan")
-    return max_abs, rmse, cosine
+    sum_a, sum_b = sum(lhs), sum(rhs)
+    return max_abs, rmse, cosine, sum_a, sum_b
 
 
 def mnn_graph_to_llama_candidates(graph_name: str) -> list[str]:
@@ -372,7 +373,7 @@ def main() -> int:
 
             lhs = read_values(mnn_meta.with_suffix("").with_suffix(".bin"), lhs_meta["dtype"], numel)
             rhs = read_values(llama_meta.with_suffix("").with_suffix(".bin"), rhs_meta["dtype"], numel)
-            max_abs, rmse, cosine = compare(lhs, rhs)
+            max_abs, rmse, cosine, sum_a, sum_b = compare(lhs, rhs)
             compared += 1
 
             status = "pass" if max_abs <= args.atol else "fail"
@@ -385,7 +386,7 @@ def main() -> int:
             print(
                 f"[{status}] {tensor_display_name} "
                 f"shape={lhs_meta['shape']} dtype={lhs_meta['dtype']} "
-                f"max_abs={max_abs:.3f} rmse={rmse:.3f} cosine={cosine:.3f}"
+                f"max_abs={max_abs:.3f} rmse={rmse:.3f} cosine={cosine:.3f} sum_a={sum_a:.4f} sum_b={sum_b:.4f}"
             )
             if status == "fail":
                 failures.append((llama_meta.name, max_abs, "value mismatch"))

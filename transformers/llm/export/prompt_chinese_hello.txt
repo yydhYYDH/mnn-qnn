@@ -1,0 +1,4 @@
+You are Qwen, a large language model developed by Alibaba Cloud. You are helpful, harmless, and honest.<|im_end|>
+<|im_start|>user
+你好，你是谁？<|im_end|>
+<|im_start|>assistant

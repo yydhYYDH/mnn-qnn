@@ -10,8 +10,8 @@ COMPARE_SCRIPT_REMOTE="${COMPARE_SCRIPT_REMOTE:-${RECK_LLAMA_DIR}/compare_tensor
 PREPARE_INPUT_LOCAL="${PREPARE_INPUT_LOCAL:-/home/chensm22/MNN/transformers/llm/export/prepare_attention_unit_input.py}"
 PREPARE_INPUT_REMOTE="${PREPARE_INPUT_REMOTE:-${RECK_LLAMA_DIR}/prepare_attention_unit_input.py}"
 
-SEQ_LEN="${SEQ_LEN:-32}"
-KV_LEN="${KV_LEN:-32}"
+SEQ_LEN="${SEQ_LEN:-128}"
+KV_LEN="${KV_LEN:-128}"
 NUM_HEADS="${NUM_HEADS:-32}"
 NUM_KV_HEADS="${NUM_KV_HEADS:-${NUM_HEADS}}"
 HEAD_DIM="${HEAD_DIM:-128}"

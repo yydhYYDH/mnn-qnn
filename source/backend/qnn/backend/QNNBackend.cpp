@@ -1536,7 +1536,7 @@ public:
                                              state.outside, updateLength, updateLength, state.inside);
                 }
             }
-            MNN_PRINT("[MNN_QNN_DUMP] %s dumped as %s to %s\n", graphName.c_str(), dumpGraphName.c_str(), dumpDir.c_str());
+            // MNN_PRINT("[MNN_QNN_DUMP] %s dumped as %s to %s\n", graphName.c_str(), dumpGraphName.c_str(), dumpDir.c_str());
         }
 
         for (int i=0; i<mOutputs.size(); ++i) {
