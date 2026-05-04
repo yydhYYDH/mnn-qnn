@@ -47,6 +47,15 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
+def linear_out_features(linear):
+    if hasattr(linear, 'out_features'):
+        return linear.out_features
+    if hasattr(linear, 'outfeatures'):
+        return linear.outfeatures
+    if hasattr(linear, 'weight'):
+        return linear.weight.shape[0]
+    raise AttributeError(f"'{type(linear).__name__}' object has no output feature attribute")
+
 class Attention(torch.nn.Module):
     def __init__(self, attn, layer_id, config, rotary, mapper):
         super().__init__()
@@ -127,7 +136,7 @@ class Attention(torch.nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         bsz, q_len, _ = hidden_states.size()
         query_states = self.q_proj(hidden_states)
-        if self.q_proj.out_features == 2 * self.num_heads * self.head_dim:
+        if linear_out_features(self.q_proj) == 2 * self.num_heads * self.head_dim:
             reshaped = query_states.view(bsz, q_len, self.num_heads, self.head_dim * 2)
             query_states, gate = torch.split(reshaped, self.head_dim, dim=-1)
             gate = gate.reshape(bsz, q_len, -1)

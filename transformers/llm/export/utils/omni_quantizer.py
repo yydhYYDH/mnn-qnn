@@ -715,6 +715,10 @@ class OmniQuantizer:
         # Run weight optimization, optionally collecting feature map info in the same pass
         self.optimize_weights(collect_feature_map=collect_feature_map)
 
+    def collect_feature_map_only(self):
+        """Collect static activation quant info for NPU export without changing weights."""
+        self._collect_feature_map_optimized()
+
     def clear_cache(self):
         """Clear cached calibration data to free memory."""
         if hasattr(self, '_cached_layer_inputs'):

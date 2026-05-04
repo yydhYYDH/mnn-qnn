@@ -27,6 +27,9 @@ class MNNConverter:
         self.lm_weight = None
         self.tie_embeddings_info = None
 
+    def should_use_gptq_placeholder(self, op_name):
+        return self.args.generate_for_npu and self.args.gptq_path is not None and op_name.startswith('/layers.')
+
     def convert(self, convert_args):
         import contextlib
         log_fp = open(EXPORT_LOG, "a")
@@ -166,6 +169,8 @@ class MNNConverter:
                 self.export_omni_quant(mnn_json)
             if self.args.smooth:
                 self.export_smooth_quant(mnn_json)
+            if hasattr(self.exporter, 'npu_description_quantizer'):
+                self.export_npu_description(mnn_json)
         return self.tie_embeddings_info
 
     def get_experts_graphs(self, experts):
@@ -224,6 +229,39 @@ class MNNConverter:
         GPTQ(self.args.gptq_path).apply(mnn_json, self.mnn_weight_path)
         return self.mnn_weight_path
 
+    @spinner_run(f'apply visual gptq to ')
+    def apply_visual_gptq(self, mnn_json, visual_gptq_path, quant_block=128):
+        from .gptq import VisualGPTQ
+        VisualGPTQ(visual_gptq_path).apply(mnn_json, self.mnn_weight_path, quant_block)
+        return self.mnn_weight_path
+
+    def export_visual_with_gptq(self, onnx_path, visual_gptq_path,
+                                 quant_block=128,
+                                 transformer_fuse=True, group_conv_native=False,
+                                 weight_sym=None):
+        """Visual model GPTQ export: onnx2mnn(fp16) -> mnn2json -> apply visual gptq -> json2mnn
+
+        Uses fp16 for initial export so merger/deepstack keep float weights.
+        Then VisualGPTQ.apply rewrites blocks Convolution to int8 with GPTQ weights,
+        rebuilding the weight file and updating JSON external offsets + quanParameter.
+        """
+        self.onnx_model_path = onnx_path
+        self.mnn_name = os.path.basename(onnx_path).replace('.onnx', '.mnn')
+        self.mnn_model_path = os.path.join(self.args.dst_path, self.mnn_name)
+        self.mnn_weight_path = f'{self.mnn_model_path}.weight'
+        if weight_sym is None:
+            weight_sym = self.args.sym
+        # Step 1: always export as fp16 first (preserves merger/deepstack as float)
+        self.onnx2mnn(self.onnx_model_path, self.mnn_model_path,
+                      ['--fp16'], transformer_fuse=transformer_fuse,
+                      group_conv_native=group_conv_native,
+                      weight_sym=weight_sym)
+        # Step 2: mnn2json -> apply GPTQ (rewrites blocks to int8, keeps rest fp16) -> json2mnn
+        mnn_json = f'{self.mnn_model_path}.json'
+        self.mnn2json(self.mnn_model_path, mnn_json)
+        self.apply_visual_gptq(mnn_json, visual_gptq_path, quant_block)
+        self.json2mnn(mnn_json, self.mnn_model_path)
+
     @spinner_run(f'export split lora to ')
     def export_lora(self, mnn_json):
         lora_model = os.path.join(self.args.dst_path, 'lora.mnn')
@@ -243,6 +281,12 @@ class MNNConverter:
     @spinner_run(f'export omni quant scale to ')
     def export_omni_quant(self, mnn_json):
         self.exporter.omni_quantizer.apply(mnn_json)
+        self.json2mnn(mnn_json, self.mnn_model_path)
+        return self.mnn_model_path
+
+    @spinner_run(f'export npu tensor describe to ')
+    def export_npu_description(self, mnn_json):
+        self.exporter.npu_description_quantizer.apply(mnn_json)
         self.json2mnn(mnn_json, self.mnn_model_path)
         return self.mnn_model_path
 
@@ -289,8 +333,8 @@ class MNNConverter:
             json.dump(mnn_graph, file, ensure_ascii=False, indent=4)
         return self.mnn_weight_path
 
-    def quant(self, weight, quant_bit, quant_block, symmetric):
-        if self.exporter.args.skip_weight:
+    def quant(self, weight, quant_bit, quant_block, symmetric, placeholder_only=False):
+        if self.exporter.args.skip_weight or placeholder_only:
             # Skip expensive quantization when skip_weight is enabled
             oc, ic = weight.shape
             if quant_block == 0:
@@ -333,10 +377,10 @@ class MNNConverter:
         header_length = dim_num + dim_length + map_length
         return header_length, shape_dtype == np.int32
 
-    def build_weight(self, linear, quant_bit, quant_block, symmetric):
+    def build_weight(self, linear, quant_bit, quant_block, symmetric, placeholder_only=False):
         ic, oc = linear.in_features, linear.out_features
         if quant_bit == 16:
-            if self.exporter.args.skip_weight:
+            if self.exporter.args.skip_weight or placeholder_only:
                 # Use a small dummy buffer and skip full weight loading/conversion
                 weight_len = (ic * oc * 2)
                 self.mnn_weight.seek(weight_len, 1)
@@ -347,14 +391,15 @@ class MNNConverter:
         else:
             q_min = 1
             assert(quant_bit in (1, 2, 4, 8))
-            q_weight, alpha = self.quant(linear.weight.data, quant_bit, quant_block, symmetric)
             header_len, shape_int32 = self.write_header(ic, oc, quant_bit)
-            if self.exporter.args.skip_weight:
+            if self.exporter.args.skip_weight or placeholder_only:
+                q_weight, alpha = self.quant(linear.weight.data, quant_bit, quant_block, symmetric, placeholder_only=True)
                 weight_len = len(q_weight) + header_len
                 self.mnn_weight.seek(len(q_weight), 1)
                 alpha_len = len(alpha) * 4
                 self.mnn_weight.seek(alpha_len, 1)
             else:
+                q_weight, alpha = self.quant(linear.weight.data, quant_bit, quant_block, symmetric)
                 weight_len = self.write_weight(q_weight) + header_len
                 alpha_len = self.write_weight(alpha)
 
@@ -531,7 +576,8 @@ class MNNConverter:
         if is_lm and self.lm_weight is not None:
             external, q_min, shape_int32, header_len = self.lm_weight
         else:
-            external, q_min, shape_int32, header_len = self.build_weight(linear, quant_bit, quant_block, quant_sym)
+            placeholder_only = self.should_use_gptq_placeholder(name)
+            external, q_min, shape_int32, header_len = self.build_weight(linear, quant_bit, quant_block, quant_sym, placeholder_only=placeholder_only)
         if is_lm and self.lm_weight is None:
             self.lm_weight = [external, q_min, shape_int32, header_len]
         if is_lm and self.args.tie_word_embeddings:
