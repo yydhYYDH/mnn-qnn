@@ -471,6 +471,70 @@ class LlmExporter(torch.nn.Module):
         self.smooth_quantizer = SmoothQuantizer(model = self.model, max_calib_samples = calib_samples, act_bit=self.args.act_bit, act_sym=self.args.act_sym, generate_for_npu=self.args.generate_for_npu)
         self.smooth_quantizer.quantize()
 
+    def _load_gptq_model_for_npu_description(self):
+        """Prefer collecting activation ranges from the actual GPTQ model.
+
+        Some callers use gptq_path only as a directory of qweight/scales tensors.
+        In that case there is no loadable torch model, so keep the historical
+        base-model fallback for activation description generation.
+        """
+        gptq_path = self.args.gptq_path
+        if gptq_path is None:
+            return self.model
+        if not os.path.exists(os.path.join(gptq_path, 'config.json')):
+            print('GPTQ path does not look like a full HF model, use base model to collect NPU description.')
+            return self.model
+
+        print(f'Loading GPTQ torch model from {gptq_path} to collect NPU activation description...')
+        collect_args = argparse.Namespace(**vars(self.args))
+        collect_args.path = gptq_path
+        collect_args.tokenizer_path = self.args.tokenizer_path
+        collect_args.lora_path = None
+        collect_args.awq = False
+        collect_args.smooth = False
+        collect_args.omni = False
+        collect_args.skip_weight = False
+
+        try:
+            gptq_model = LlmModel.from_pretrained(gptq_path, args=collect_args)
+            # Keep tokenization identical to the exported base model.
+            gptq_model.tokenizer = self.tokenizer
+            return gptq_model
+        except Exception as e:
+            print(f'Warning: failed to load GPTQ torch model for NPU description: {e}')
+            print('Fallback to base model activation collection.')
+            return self.model
+
+    def collect_npu_description_for_gptq(self):
+        default_samples = 128
+        total_lines = default_samples
+
+        if self.args.calib_data:
+            print(f"检测到 calib_data: {self.args.calib_data}，开始读取...")
+            self.model.args.calib_data = self.args.calib_data
+
+            if os.path.exists(self.args.calib_data):
+                with open(self.args.calib_data, 'r', encoding='utf-8') as f:
+                    total_lines = sum(1 for _ in f)
+            else:
+                print(f"错误：找不到文件 {self.args.calib_data}")
+
+        calib_samples = min(total_lines, default_samples)
+        print(f"GPTQ NPU 描述生成将使用 {calib_samples} 个样本收集激活信息...")
+        collect_model = self._load_gptq_model_for_npu_description()
+
+        self.npu_description_quantizer = OmniQuantizer(
+            model=collect_model,
+            max_calib_samples=calib_samples,
+            act_bit=self.args.act_bit,
+            act_sym=self.args.act_sym,
+            generate_for_npu=True,
+            epochs=getattr(self.args, 'omni_epochs', 20),
+            lr=getattr(self.args, 'omni_lr', 5e-3),
+            wd=getattr(self.args, 'omni_wd', 1e-4)
+        )
+        self.npu_description_quantizer.collect_feature_map_only()
+
     def export_vision(self):
         if self.visual is None:
             return
@@ -488,11 +552,23 @@ class LlmExporter(torch.nn.Module):
                 quant_bit_visual = self.args.visual_quant_bit
             if self.args.visual_quant_block is not None:
                 quant_block_visual = self.args.visual_quant_block
-            self.mnn_converter.export(vision_onnx, quant_bit_visual,
-                                      quant_block_visual,
-                                      transformer_fuse=fuse_transformer,
-                                      group_conv_native=native_group_conv,
-                                      weight_sym=self.args.visual_sym)
+            if self.args.visual_gptq_path is not None:
+                # GPTQ path: onnx2mnn(fp16) -> mnn2json -> apply visual gptq(blocks->int8) -> json2mnn
+                # merger/deepstack/patch_embed keep fp16, only blocks are replaced with GPTQ int8
+                self.mnn_converter.export_visual_with_gptq(
+                    vision_onnx,
+                    self.args.visual_gptq_path,
+                    quant_block=quant_block_visual if quant_block_visual else 128,
+                    transformer_fuse=fuse_transformer,
+                    group_conv_native=native_group_conv,
+                    weight_sym=self.args.visual_sym
+                )
+            else:
+                self.mnn_converter.export(vision_onnx, quant_bit_visual,
+                                          quant_block_visual,
+                                          transformer_fuse=fuse_transformer,
+                                          group_conv_native=native_group_conv,
+                                          weight_sym=self.args.visual_sym)
 
     def export_audio(self):
         if self.audio is None:
@@ -530,13 +606,19 @@ class LlmExporter(torch.nn.Module):
             self.onnx_load_param(onnx_model)
 
     def export(self, export_type):
+        gptq_npu_describe_only = self.args.generate_for_npu and self.args.gptq_path is not None
         if not self.args.skip_weight:
-            if self.args.omni:
-                self.omni_quant()
-            if self.args.awq:
-                self.awq_quant()
-            if self.args.smooth:
-                self.smooth_quant()
+            if gptq_npu_describe_only:
+                if self.args.omni or self.args.smooth or self.args.awq:
+                    print('检测到 GPTQ + generate_for_npu，跳过 awq/smooth/omni 权重量化，仅生成 NPU 描述。')
+                self.collect_npu_description_for_gptq()
+            else:
+                if self.args.omni:
+                    self.omni_quant()
+                if self.args.awq:
+                    self.awq_quant()
+                if self.args.smooth:
+                    self.smooth_quant()
         export_mnn = export_type == 'mnn'
         self.mnn_converter = MNNConverter(self) if export_mnn else None
         self.export_talker()
@@ -691,6 +773,7 @@ def build_args(parser):
     parser.add_argument('--eagle_path', type=str, default=None, help='eagle model path, default is `None`')
     parser.add_argument('--lora_path', type=str, default=None, help='lora path, default is `None` mean not apply lora.')
     parser.add_argument('--gptq_path', type=str, default=None, help='gptq path, default is `None` mean not apply gptq.')
+    parser.add_argument('--visual_gptq_path', type=str, default=None, help='gptq path for visual model, default is `None` mean not apply visual gptq.')
     parser.add_argument('--dst_path', type=str, default='./model', help='export onnx/mnn model to path, default is `./model`.')
     parser.add_argument('--verbose', action='store_true', help='Whether or not to print verbose.')
     parser.add_argument('--test', type=str, help='test model inference with query `TEST`.')
@@ -757,6 +840,7 @@ def main():
         llm_exporter.response(args.test)
 
     if args.export is not None:
+        print('export model to', args.export)
         llm_exporter.export(args.export)
 
 if __name__ == '__main__':
